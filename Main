@@ -1,0 +1,32 @@
+from river import anomaly, stats
+from river import preprocessing
+import random
+
+# Example: vehicle temperature sensor
+model = anomaly.HalfSpaceTrees(seed=42)
+
+# Track rolling mean and variance too
+rolling_mean = stats.Mean()
+rolling_var = stats.Var()
+
+# Simulated live data stream
+for t in range(1, 500):
+    # Example sensor reading (normally around 90 with noise)
+    sensor_value = 90 + random.gauss(0, 2)
+
+    # Update rolling stats
+    mean_val = rolling_mean.update(sensor_value).get()
+    var_val = rolling_var.update(sensor_value).get()
+
+    # Update anomaly model
+    score = model.score_one({"temp": sensor_value})
+    model = model.learn_one({"temp": sensor_value})
+
+    # Simple tolerance band (mean ± 3*std)
+    tolerance_low = mean_val - 3 * (var_val ** 0.5)
+    tolerance_high = mean_val + 3 * (var_val ** 0.5)
+
+    # Flag if outside band
+    if sensor_value < tolerance_low or sensor_value > tolerance_high:
+        print(f"[ALERT] Value {sensor_value:.2f} outside tolerance {tolerance_low:.2f}-{tolerance_high:.2f}")
+]
