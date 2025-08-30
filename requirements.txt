@@ -1,7 +1,7 @@
 streamlit
 pandas
 requests
+sqlalchemy
 fastapi
 uvicorn
-sqlite-utils
 river
