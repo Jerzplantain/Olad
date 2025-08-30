@@ -1,3 +1,7 @@
 streamlit
 pandas
 requests
+fastapi
+uvicorn
+sqlite-utils
+river
