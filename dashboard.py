@@ -6,6 +6,7 @@ import time
 # FastAPI server URL
 SERVER_URL = "https://olad.onrender.com/data"
 
+
 st.set_page_config(page_title="Vehicle Data Dashboard", layout="wide")
 st.title("📊 Vehicle Sensor Data Dashboard")
 
@@ -72,6 +73,7 @@ while True:
 
     # Wait and refresh
     time.sleep(REFRESH_RATE)
+
 
 
 
