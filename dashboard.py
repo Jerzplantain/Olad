@@ -6,7 +6,7 @@ from supabase import create_client
 
 # --- Supabase config ---
 SUPABASE_URL = "https://zhrlppnknfjxhwhfsdxd.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCjS3hKbrg2Wdy1hjSPV1gWxnN_yU"  # read-only anon
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU"   # ⚠️ Use service_role key for updates
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="Vehicle Data Dashboard", layout="wide")
@@ -72,3 +72,4 @@ if not df.empty:
 
 else:
     st.error("No data available from Supabase.")
+
