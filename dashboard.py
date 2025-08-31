@@ -1,12 +1,14 @@
 # dashboard.py
 import streamlit as st
 import pandas as pd
-import requests
 from datetime import datetime, timedelta
 import random
+from supabase import create_client
 
-# Render server URL
-SERVER_URL = "https://olad.onrender.com/data"
+# --- Supabase config ---
+SUPABASE_URL = "https://zhrlppnknfjxhwhfsdxd.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU"  # Use anon key for read-only dashboard
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="Vehicle Data Dashboard", layout="wide")
 st.title("📊 Vehicle Sensor Data Dashboard")
@@ -30,18 +32,25 @@ def generate_demo_data():
             })
     return pd.DataFrame(data)
 
-# Fetch data from Render API
-try:
-    response = requests.get(SERVER_URL, timeout=5)
-    if response.status_code == 200:
-        data = response.json()["data"]
-        df = pd.DataFrame(data)
-    else:
-        st.warning("⚠️ Could not fetch data from API. Showing demo data.")
-        df = generate_demo_data()
-except Exception:
-    st.warning("⚠️ API not reachable. Showing demo data.")
-    df = generate_demo_data()
+# --- Fetch from Supabase ---
+def fetch_data():
+    try:
+        response = (
+            supabase.table("sensor_data")
+            .select("vehicle_id, sensor, value, timestamp")
+            .order("timestamp", desc=False)
+            .limit(500)  # pull latest 500
+            .execute()
+        )
+        if response.data:
+            return pd.DataFrame(response.data)
+        else:
+            return generate_demo_data()
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch data from Supabase. Showing demo data. ({e})")
+        return generate_demo_data()
+
+df = fetch_data()
 
 if not df.empty:
     if "timestamp" in df.columns:
