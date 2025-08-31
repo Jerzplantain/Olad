@@ -1,4 +1,4 @@
-# dashboard.py (wide-format Supabase)
+# dashboard.py (wide-format Supabase with alert summary)
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -6,7 +6,7 @@ from supabase import create_client
 
 # --- Supabase config ---
 SUPABASE_URL = "https://zhrlppnknfjxhwhfsdxd.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU"   # ⚠️ Use service_role key for updates
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU"  # read-only anon
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="Vehicle Data Dashboard", layout="wide")
@@ -34,11 +34,9 @@ def fetch_data():
         )
         if response.data:
             df = pd.DataFrame(response.data)
-
             # Convert timestamp to datetime
             if "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
-
             return df
         else:
             return pd.DataFrame()
@@ -55,6 +53,12 @@ if not df.empty:
     if selected_vehicle != "All":
         df = df[df["vehicle_id"] == selected_vehicle]
 
+    # --- Alert summary ---
+    st.subheader("⚠️ Sensor Alert Summary")
+    if ALERT_COLUMNS:
+        alert_counts = df[ALERT_COLUMNS].sum().sort_values(ascending=False)
+        st.bar_chart(alert_counts)
+
     # --- Raw data table ---
     st.subheader("Raw Data Table")
     st.dataframe(df.tail(20))
@@ -67,9 +71,7 @@ if not df.empty:
 
     # --- Alerts / anomaly table ---
     st.subheader("Sensor Alerts & Anomaly Scores (Last 20 entries)")
-    alert_cols = [c for c in df.columns if "_alert" in c or "_anomaly" in c]
-    st.dataframe(df[["vehicle_id", "timestamp"] + alert_cols].tail(20))
+    st.dataframe(df[["vehicle_id", "timestamp"] + ALERT_COLUMNS + ANOMALY_COLUMNS].tail(20))
 
 else:
     st.error("No data available from Supabase.")
-
