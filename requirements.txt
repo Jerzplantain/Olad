@@ -5,3 +5,4 @@ sqlalchemy
 fastapi
 uvicorn
 river
+supabase
