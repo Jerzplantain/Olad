@@ -1,12 +1,14 @@
-import sqlite3
 from datetime import datetime
 from river import anomaly, preprocessing
 import time
+from supabase import create_client
 
-# Database file
-DB_FILE = "vehicle_data.db"
+# --- Supabase setup ---
+SUPABASE_URL = "https://zhrlppnknfjxhwhfsdxd.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU"   # ⚠️ Use service_role key for updates
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# New sensor list
+# Sensors we allow
 SENSORS = [
     "Battery voltage",
     "Fuel trim",
@@ -19,36 +21,38 @@ SENSORS = [
     "Transmission oil temperature"
 ]
 
-# Create a model for each vehicle and each sensor
+# Models per vehicle/sensor
 vehicle_models = {}
 
-# Function to fetch new data from DB
-def fetch_data():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, vehicle_id, sensor, value FROM sensor_data WHERE anomaly_score IS NULL ORDER BY timestamp ASC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-# Function to update anomaly score in DB
-def update_score(row_id, score):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE sensor_data SET anomaly_score=? WHERE id=?", (score, row_id))
-    conn.commit()
-    conn.close()
-
-# Initialize models
 def get_model(vehicle_id, sensor):
     if vehicle_id not in vehicle_models:
         vehicle_models[vehicle_id] = {}
     if sensor not in vehicle_models[vehicle_id]:
-        # Use z-score + HalfSpaceTrees for anomaly detection
-        vehicle_models[vehicle_id][sensor] = preprocessing.StandardScaler() | anomaly.HalfSpaceTrees(seed=42, n_trees=25, height=5)
+        # Normalize then anomaly detect
+        vehicle_models[vehicle_id][sensor] = (
+            preprocessing.StandardScaler() | anomaly.HalfSpaceTrees(seed=42, n_trees=25, height=5)
+        )
     return vehicle_models[vehicle_id][sensor]
 
-print("Starting online learning for vehicle sensors...")
+# Fetch rows without anomaly_score
+def fetch_data():
+    response = (
+        supabase.table("sensor_data")
+        .select("id, vehicle_id, sensor, value")
+        .is_("anomaly_score", None)
+        .order("timestamp", desc=False)
+        .limit(100)  # batch for efficiency
+        .execute()
+    )
+    if response.data:
+        return response.data
+    return []
+
+# Update anomaly_score in Supabase
+def update_score(row_id, score):
+    supabase.table("sensor_data").update({"anomaly_score": score}).eq("id", row_id).execute()
+
+print("🚗 Starting online anomaly learning with Supabase...")
 
 while True:
     rows = fetch_data()
@@ -56,9 +60,13 @@ while True:
         time.sleep(2)
         continue
 
-    for row_id, vehicle_id, sensor, value in rows:
+    for row in rows:
+        row_id = row["id"]
+        vehicle_id = row["vehicle_id"]
+        sensor = row["sensor"]
+        value = row["value"]
+
         if sensor not in SENSORS:
-            # Skip any sensors not in our defined list
             continue
 
         model = get_model(vehicle_id, sensor)
@@ -66,10 +74,7 @@ while True:
         score = model.score_one(x)
         model.learn_one(x)
 
-        # Update anomaly score in DB
         update_score(row_id, float(score))
-
         print(f"[{vehicle_id}] {sensor}={value} | anomaly_score={score:.4f}")
-    
-    # Small delay to prevent busy loop
+
     time.sleep(1)
