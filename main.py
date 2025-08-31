@@ -126,4 +126,4 @@ def get_vehicle_stats(vehicle_id: str):
             }
 
     return {"vehicle_id": vehicle_id, "stats": stats}
-]
+
