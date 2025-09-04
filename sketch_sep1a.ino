@@ -1,15 +1,13 @@
 // --- Fix Arduino auto-prototype issue:
-struct Sample;   // forward declaration
+struct Sample;   // forward declaration so prototypes can reference Sample
 
-// ====== ESP32 + TWAI (CAN) + Supabase OBD-II Logger ======
+// ====== ESP32 + TWAI (CAN) + Supabase OBD-II Logger (fuel trims + runtime) ======
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
 #include "driver/twai.h"
-#include <math.h>
-#include <map>
-#include <array>
+#include <math.h>  // isnan, NAN, fabsf
 
 // ---- Safely detect ESP-IDF major version ----
 #if defined(__has_include)
@@ -54,22 +52,20 @@ struct Sample;   // forward declaration
   #define TWAI_TIMING   TWAI_TIMING_CONFIG_250KBITS()
 #endif
 
+// Upload throttling
 const unsigned long MIN_UPLOAD_INTERVAL_MS = 5000;
 const unsigned long MAX_UPLOAD_INTERVAL_MS = 60000;
 
 // Change thresholds
-const float THRESH_RPM      = 50.0f;
-const float THRESH_COOLANT  = 1.0f;
-const float THRESH_BATT     = 0.10f;
-const float THRESH_STFT     = 1.0f;
-const float THRESH_LTFT     = 0.5f;
+const float THRESH_RPM      = 50.0f;   // rpm
+const float THRESH_COOLANT  = 1.0f;    // °C
+const float THRESH_BATT     = 0.10f;   // V
+const float THRESH_STFT     = 1.0f;    // %
+const float THRESH_LTFT     = 0.5f;    // %
 
-// Raw frame sampling
+// Raw OBD reply sampling (ON, but OBD-only)
 #define ENABLE_RAW_SAMPLING      1
 const unsigned long RAW_SAMPLE_EVERY_MS = 10000;
-
-// Extended functional requests
-#define SEND_EXTENDED_REQUESTS 0
 
 // ===== Wi-Fi =====
 const char* ssids[]     = {"Galaxy"};
@@ -79,24 +75,24 @@ const int networkCount  = sizeof(ssids) / sizeof(ssids[0]);
 // ===== Supabase =====
 String serverUrl   = "https://zhrlppnknfjxhwhfsdxd.supabase.co/rest/v1/sensor_data";
 String rawUrl      = "https://zhrlppnknfjxhwhfsdxd.supabase.co/rest/v1/can_raw";
-String SUPABASE_KEY= "<eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU>";
+String SUPABASE_KEY= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU";
 String vehicle_id  = "NJ test facility 01";
 
 // ===== Pins =====
 const int LED_PIN = 2;
-const int RX_PIN  = 21;
-const int TX_PIN  = 22;
+const int RX_PIN  = 21;   // ESP32 RX (to transceiver TXD/CRX)
+const int TX_PIN  = 22;   // ESP32 TX (to transceiver RXD/CTX)
 
 // ===== Upload types =====
 struct Sample {
-  float batt      = NAN;  // PID 0x42
-  float coolant   = NAN;  // 0x05
-  float rpm       = NAN;  // 0x0C
-  float stft_b1   = NAN;  // 0x06
-  float ltft_b1   = NAN;  // 0x07
-  float stft_b2   = NAN;  // 0x08
-  float ltft_b2   = NAN;  // 0x09
-  long  runtime_s = -1;   // 0x1F
+  float batt      = NAN;  // PID 0x42 (V)
+  float coolant   = NAN;  // 0x05 (°C)
+  float rpm       = NAN;  // 0x0C (rpm)
+  float stft_b1   = NAN;  // 0x06 (%)
+  float ltft_b1   = NAN;  // 0x07 (%)
+  float stft_b2   = NAN;  // 0x08 (%)
+  float ltft_b2   = NAN;  // 0x09 (%)
+  long  runtime_s = -1;   // 0x1F (seconds)
 };
 
 inline bool valid(float v) { return !isnan(v); }
@@ -123,14 +119,8 @@ void connectWiFi() {
 
 // ===== HTTPS helper =====
 bool postJson(const String& url, const String& jsonPayload) {
-  Serial.println("=== SUPABASE POST DEBUG ===");
-  Serial.print("URL: "); Serial.println(url);
-  Serial.print("Payload: "); Serial.println(jsonPayload);
-  Serial.println("===========================");
-
   WiFiClientSecure client;
   client.setInsecure();
-
   HTTPClient http;
   if (!http.begin(client, url)) {
     Serial.println("HTTP begin failed");
@@ -139,15 +129,26 @@ bool postJson(const String& url, const String& jsonPayload) {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "return=representation");
 
   int status = http.POST(jsonPayload);
-  Serial.printf("HTTP status: %d\n", status);
-  String resp = http.getString();
-  Serial.print("Response body: "); Serial.println(resp);
-
+  bool ok = (status >= 200 && status < 300);
+  Serial.printf("HTTP %d\n", status);
+  if (!ok) Serial.println(http.getString());
   http.end();
-  return (status >= 200 && status < 300);
+  return ok;
+}
+
+// ===== Helpers to detect/limit to OBD replies =====
+static inline bool isStdObdReply(uint32_t id) {
+  return (id >= 0x7E8 && id <= 0x7EF);
+}
+static inline bool isExtObdReply(uint32_t id, bool isExt) {
+  // Typical 29-bit ISO-TP reply template: 0x18DAF1xx
+  return isExt && ((id & 0x1FFFFF00UL) == 0x18DAF100UL);
+}
+static inline bool isPositiveService01(const uint8_t* d, int len) {
+  // Single-frame positive response: [len>=4] [0x41] [pid] [A] ...
+  return (len >= 4 && d[1] == 0x41);
 }
 
 // ===== Upload helpers =====
@@ -156,57 +157,34 @@ void sendData(const Sample& s) {
     connectWiFi();
     if (WiFi.status() != WL_CONNECTED) return;
   }
-
   StaticJsonDocument<600> doc;
   doc["vehicle_id"] = vehicle_id;
-  doc["timestamp"] = millis();
-
-  doc["battery_voltage"] = valid(s.batt) ? s.batt : 0;
-  doc["engine_coolant_temp"] = valid(s.coolant) ? s.coolant : 0;
-  doc["coolant_temperature"] = valid(s.coolant) ? s.coolant : 0;
-  doc["engine_rpms"] = valid(s.rpm) ? s.rpm : 0;
-  doc["engine_runtime_s"] = s.runtime_s >= 0 ? s.runtime_s : 0;
-  doc["time_since_engine_start"] = s.runtime_s >= 0 ? s.runtime_s : 0;
-
-  doc["stft_b1_pct"] = valid(s.stft_b1) ? s.stft_b1 : 0;
-  doc["ltft_b1_pct"] = valid(s.ltft_b1) ? s.ltft_b1 : 0;
-  doc["stft_b2_pct"] = valid(s.stft_b2) ? s.stft_b2 : 0;
-  doc["ltft_b2_pct"] = valid(s.ltft_b2) ? s.ltft_b2 : 0;
-
-  doc["short_term_fuel_trim_b1"] = valid(s.stft_b1) ? s.stft_b1 : 0;
-  doc["short_term_fuel_trim_b2"] = valid(s.stft_b2) ? s.stft_b2 : 0;
-
-  doc["fuel_trim"] = 0;
-  doc["alert"] = "{}";
-  doc["anomaly_score"] = "{}";
+  if (valid(s.batt))      doc["battery_voltage"]      = s.batt;
+  if (valid(s.coolant))   doc["coolant_temperature"]  = s.coolant;
+  if (valid(s.rpm))       doc["engine_rpms"]          = s.rpm;
+  if (s.runtime_s >= 0)   doc["engine_runtime_s"]     = s.runtime_s;
+  if (valid(s.stft_b1))   doc["stft_b1_pct"]          = s.stft_b1;
+  if (valid(s.ltft_b1))   doc["ltft_b1_pct"]          = s.ltft_b1;
+  if (valid(s.stft_b2))   doc["stft_b2_pct"]          = s.stft_b2;
+  if (valid(s.ltft_b2))   doc["ltft_b2_pct"]          = s.ltft_b2;
 
   String payload; serializeJson(doc, payload);
   bool ok = postJson(serverUrl, payload);
   Serial.printf("📡 PID Upload %s\n", ok ? "OK" : "FAIL");
 }
 
-// ===== RAW frame logging =====
-struct RawCache {
-  unsigned long lastUpload = 0;
-  std::array<uint8_t, 8> lastData{};
-};
-std::map<uint32_t, RawCache> rawCache;
-
 void sendRawFrame(uint32_t packetId, bool isExt, const uint8_t *buf, int len) {
+  if (!ENABLE_RAW_SAMPLING) return;
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
     if (WiFi.status() != WL_CONNECTED) return;
   }
-
   StaticJsonDocument<256> doc;
   doc["vehicle_id"]  = vehicle_id;
   doc["can_id"]      = packetId;
   doc["is_extended"] = isExt;
-  doc["dlc"]         = len;
-
   JsonArray dataArr = doc.createNestedArray("data");
   for (int i = 0; i < len; i++) dataArr.add(buf[i]);
-
   String payload; serializeJson(doc, payload);
   bool ok = postJson(rawUrl, payload);
   Serial.printf("📡 RAW Upload %s\n", ok ? "OK" : "FAIL");
@@ -217,10 +195,10 @@ bool sendOBDRequest(uint32_t id, bool extended, uint8_t pid) {
   twai_message_t msg = {};
   msg.identifier = id;
   msg.data_length_code = 8;
-  msg.data[0] = 0x02;
-  msg.data[1] = 0x01;
+  msg.data[0] = 0x02;   // 2 data bytes follow (mode+pid)
+  msg.data[1] = 0x01;   // Mode 01 - current data
   msg.data[2] = pid;
-  for (int i = 3; i < 8; i++) msg.data[i] = 0x00;
+  msg.data[3] = 0x00; msg.data[4] = 0x00; msg.data[5] = 0x00; msg.data[6] = 0x00; msg.data[7] = 0x00;
   TWAI_SET_EXTD(msg, extended);
 
   esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(50));
@@ -233,20 +211,72 @@ bool sendOBDRequest(uint32_t id, bool extended, uint8_t pid) {
 }
 
 float parsePID(uint32_t can_id, bool isExt, const uint8_t *d, int len, uint8_t pid) {
-  bool idMatch = (!isExt && (can_id >= 0x7E8 && can_id <= 0x7EF))
-              || (isExt && (can_id == 0x18DAF110));
-  if (!idMatch || len < 5 || d[1] != 0x41 || d[2] != pid) return NAN;
+  // Accept only known OBD reply IDs and positive Service 01 responses
+  if (!(isStdObdReply(can_id) || isExtObdReply(can_id, isExt))) return NAN;
+  if (!isPositiveService01(d, len)) return NAN;
+  if (d[2] != pid) return NAN;
 
-  uint8_t A = d[3], B = d[4];
+  uint8_t A = (len > 3 ? d[3] : 0), B = (len > 4 ? d[4] : 0);
   switch (pid) {
-    case 0x42: return ((A * 256.0f) + B) / 1000.0f;
-    case 0x05: return (float)A - 40.0f;
-    case 0x0C: return ((A * 256.0f) + B) / 4.0f;
-    case 0x06: case 0x07: case 0x08: case 0x09:
-      return ((float)A - 128.0f) * (100.0f / 128.0f);
-    case 0x1F: return (A * 256.0f) + B;
+    case 0x42: return ((A * 256.0f) + B) / 1000.0f;         // Control module voltage (V)
+    case 0x05: return (float)A - 40.0f;                     // Coolant °C
+    case 0x0C: return ((A * 256.0f) + B) / 4.0f;            // RPM
+    case 0x06: // STFT B1
+    case 0x07: // LTFT B1
+    case 0x08: // STFT B2
+    case 0x09: // LTFT B2
+      return ((float)A - 128.0f) * (100.0f / 128.0f);       // %
+    case 0x1F: return (A * 256.0f) + B;                     // Runtime seconds
   }
   return NAN;
+}
+
+// Poll a single PID and wait briefly for its reply so frames don't get mixed
+bool requestPidAndCollect(uint8_t pid, Sample& acc, unsigned long wait_ms = 120) {
+  // Flush RX queue quickly to avoid stale frames
+  twai_message_t tmp;
+  while (twai_receive(&tmp, 0) == ESP_OK) {}
+
+  if (!sendOBDRequest(0x7DF, false, pid)) return false;
+
+  unsigned long t0 = millis();
+  twai_message_t rx;
+  bool got = false;
+
+  while (millis() - t0 < wait_ms) {
+    if (twai_receive(&rx, pdMS_TO_TICKS(10)) == ESP_OK) {
+      bool isExt = TWAI_IS_EXTD(rx);
+      uint32_t id = rx.identifier;
+      int len = rx.data_length_code;
+
+      // Upload raw ONLY if it's a legit OBD reply
+      if ((isStdObdReply(id) || isExtObdReply(id, isExt)) && isPositiveService01(rx.data, len)) {
+        static unsigned long nextRaw = 0;
+        unsigned long now = millis();
+        if (ENABLE_RAW_SAMPLING && now >= nextRaw) {
+          nextRaw = now + RAW_SAMPLE_EVERY_MS;
+          sendRawFrame(id, isExt, rx.data, len);
+        }
+      }
+
+      float v = parsePID(id, isExt, rx.data, len, pid);
+      if (!isnan(v)) {
+        switch (pid) {
+          case 0x42: acc.batt      = v; break;
+          case 0x05: acc.coolant   = v; break;
+          case 0x0C: acc.rpm       = v; break;
+          case 0x06: acc.stft_b1   = v; break;
+          case 0x07: acc.ltft_b1   = v; break;
+          case 0x08: acc.stft_b2   = v; break;
+          case 0x09: acc.ltft_b2   = v; break;
+          case 0x1F: acc.runtime_s = (long)v; break;
+        }
+        got = true;
+        break; // stop after first good match for this PID
+      }
+    }
+  }
+  return got;
 }
 
 // ===== TWAI init =====
@@ -280,7 +310,7 @@ bool twaiInit() {
 }
 
 // ===== Upload gating =====
-Sample lastSent;
+Sample lastSent;                 // will be filled on first upload
 unsigned long lastUploadAt = 0;
 
 bool changedEnough(const Sample& prev, const Sample& cur) {
@@ -318,77 +348,27 @@ void setup() {
 
 // ================== Loop ==================
 void loop() {
-  // 1) Send Mode 01 requests
-  sendOBDRequest(0x7DF, false, 0x42); // battery
-  sendOBDRequest(0x7DF, false, 0x05); // coolant
-  sendOBDRequest(0x7DF, false, 0x0C); // RPM
-  sendOBDRequest(0x7DF, false, 0x1F); // runtime
-  sendOBDRequest(0x7DF, false, 0x06); // STFT B1
-  sendOBDRequest(0x7DF, false, 0x07); // LTFT B1
-  sendOBDRequest(0x7DF, false, 0x08); // STFT B2
-  sendOBDRequest(0x7DF, false, 0x09); // LTFT B2
-
-#if SEND_EXTENDED_REQUESTS
-  sendOBDRequest(0x18DB33F1, true,  0x42);
-  sendOBDRequest(0x18DB33F1, true,  0x05);
-  sendOBDRequest(0x18DB33F1, true,  0x0C);
-  sendOBDRequest(0x18DB33F1, true,  0x1F);
-  sendOBDRequest(0x18DB33F1, true,  0x06);
-  sendOBDRequest(0x18DB33F1, true,  0x07);
-  sendOBDRequest(0x18DB33F1, true,  0x08);
-  sendOBDRequest(0x18DB33F1, true,  0x09);
-#endif
-
-  delay(100);
-
-  // 2) Read responses for ~500 ms and decode
+  // Poll each PID one-at-a-time to avoid mixed frames
   Sample cur;  // defaults: NaNs/-1
-  unsigned long start = millis();
-  twai_message_t rx_msg;
 
-  while (millis() - start < 500) {
-    if (twai_receive(&rx_msg, pdMS_TO_TICKS(10)) == ESP_OK) {
-      bool isExt   = TWAI_IS_EXTD(rx_msg);
-      int  len     = rx_msg.data_length_code;
-      uint32_t id  = rx_msg.identifier;
+  // Order matters a bit: fast-changing first
+  requestPidAndCollect(0x0C, cur, 150); // RPM
+  delay(20);
+  requestPidAndCollect(0x05, cur, 150); // Coolant
+  delay(20);
+  requestPidAndCollect(0x42, cur, 150); // Battery/Module V
+  delay(20);
+  requestPidAndCollect(0x1F, cur, 150); // Runtime
+  delay(20);
+  requestPidAndCollect(0x06, cur, 150); // STFT B1
+  delay(20);
+  requestPidAndCollect(0x07, cur, 150); // LTFT B1
+  delay(20);
+  requestPidAndCollect(0x08, cur, 150); // STFT B2
+  delay(20);
+  requestPidAndCollect(0x09, cur, 150); // LTFT B2
 
-      Serial.printf("⬇️ RX %s ID: 0x%X  LEN: %d  Data:", isExt ? "EXT" : "STD", id, len);
-      for (int i = 0; i < len; i++) Serial.printf(" %02X", rx_msg.data[i]);
-      Serial.println();
-
-      // Parse known PIDs
-      float v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x42); if (!isnan(v)) cur.batt      = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x05); if (!isnan(v)) cur.coolant   = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x0C); if (!isnan(v)) cur.rpm       = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x06); if (!isnan(v)) cur.stft_b1   = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x07); if (!isnan(v)) cur.ltft_b1   = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x08); if (!isnan(v)) cur.stft_b2   = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x09); if (!isnan(v)) cur.ltft_b2   = v;
-      v = parsePID(id, isExt, rx_msg.data, len, 0x1F); if (!isnan(v)) cur.runtime_s = (long)v;
-
-      // --- Optimized raw CAN logging ---
-#if ENABLE_RAW_SAMPLING
-      unsigned long nowRaw = millis();
-      uint32_t key = (isExt ? 0x80000000 : 0) | id;  // unique key per ID + ext flag
-      RawCache &entry = rawCache[key];
-
-      std::array<uint8_t, 8> currentData{};
-      memcpy(currentData.data(), rx_msg.data, len);
-
-      bool dataChanged = (currentData != entry.lastData);
-      bool timeExceeded = (nowRaw - entry.lastUpload >= RAW_SAMPLE_EVERY_MS);
-
-      if (dataChanged || timeExceeded) {
-        entry.lastData = currentData;
-        entry.lastUpload = nowRaw;
-        sendRawFrame(id, isExt, rx_msg.data, len);
-      }
-#endif
-    }
-  }
-
-  // 3) Upload PID data if changed enough
+  // Upload if changed enough (or keep-alive)
   unsigned long now = millis();
   if (shouldUpload(lastSent, cur, now)) {
     sendData(cur);
@@ -396,7 +376,7 @@ void loop() {
     lastUploadAt = now;
   }
 
-  // 4) Bus health alerts
+  // Bus health alerts
   uint32_t al = 0;
   if (twai_read_alerts(&al, 0) == ESP_OK && al) {
     Serial.print("TWAI alerts:");
@@ -410,5 +390,7 @@ void loop() {
     Serial.println();
   }
 
-  delay(500);
+  // Light heartbeat
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  delay(250);
 }
