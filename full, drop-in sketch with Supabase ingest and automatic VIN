@@ -1,4 +1,4 @@
-// ==== ESP32 OBD-II PID poller → Supabase (ignition-aware uploads) ====
+// ==== ESP32 OBD-II PID poller → Supabase (VIN as vehicle_id + vin column) ====
 // Pins: GPIO22 -> CTX, GPIO21 -> CRX
 
 #include <Arduino.h>
@@ -11,8 +11,8 @@
 #include <ctype.h>
 
 // ---------- EDIT (Wi-Fi) ----------
-const char* WIFI_SSID = "iPhone";
-const char* WIFI_PASS = "american";
+const char* WIFI_SSID = "YOUR_WIFI";
+const char* WIFI_PASS = "YOUR_PASS";
 
 // ===== Supabase host + paths (host+path form improves TLS/SNI reliability) =====
 const char* SUPABASE_HOST = "zhrlppnknfjxhwhfsdxd.supabase.co";
@@ -20,7 +20,7 @@ const char* SENSOR_PATH   = "/rest/v1/sensor_data";   // parsed PIDs
 const char* RAW_PATH      = "/rest/v1/can_raw";       // raw frames
 String SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU";
 
-// Will be set from Mode 09 PID 02 (VIN) once ECUs are awake:
+// VIN becomes our vehicle_id once detected:
 String vehicle_id = "unknown";
 
 // ---- CAN pins ----
@@ -41,7 +41,7 @@ struct Frame {
 WiFiClientSecure secureClient;
 HTTPClient http;
 
-// ---------------- Util / Debug ----------------
+// ---------------- Wi-Fi helpers ----------------
 static bool wifiConnect() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -56,7 +56,6 @@ static bool wifiConnect() {
   Serial.println("WiFi FAILED");
   return false;
 }
-
 static void ensureWifi() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi dropped — reconnecting...");
@@ -73,7 +72,6 @@ static bool canInitNormal() {
   if (twai_start() != ESP_OK) return false;
   return true;
 }
-
 static void pushFromMsg(Frame& dst, const twai_message_t& m) {
   dst.ts  = millis();
   bool ext = (m.flags & TWAI_MSG_FLAG_EXTD);
@@ -83,11 +81,10 @@ static void pushFromMsg(Frame& dst, const twai_message_t& m) {
   for (int i=0;i<dst.dlc && i<8;i++) dst.data[i] = m.data[i];
 }
 
-// ---------------- Supabase helpers (SNI-safe begin) ----------------
+// ---------------- Supabase (HTTPS) ----------------
 static bool httpBeginHostPath(HTTPClient& cli, const char* host, const char* path) {
   return cli.begin(secureClient, host, 443, path, true); // https + SNI
 }
-
 static bool supabasePostJson(const char* path, const String& payload) {
   ensureWifi();
   if (!httpBeginHostPath(http, SUPABASE_HOST, path)) {
@@ -96,12 +93,10 @@ static bool supabasePostJson(const char* path, const String& payload) {
   }
   http.setTimeout(15000);
   secureClient.setTimeout(15000);
-
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_KEY);
   http.addHeader("Authorization", "Bearer " + SUPABASE_KEY);
   http.addHeader("Prefer", "return=minimal");
-
   int code = http.POST((uint8_t*)payload.c_str(), payload.length());
   String resp = http.getString();
   Serial.printf("POST %d to https://%s%s\n", code, SUPABASE_HOST, path);
@@ -114,14 +109,17 @@ static bool supabasePostJson(const char* path, const String& payload) {
   return true;
 }
 
-// Post one parsed sensor row to public.sensor_data
+// ---------------- Posting helpers ----------------
 static bool postSensorData(
   float batt, float coolant, float rpm,
   float stft_b1, float ltft_b1, float stft_b2, float ltft_b2,
   long runtime_s
 ) {
   StaticJsonDocument<512> doc;
+  // Use VIN as vehicle_id and also store in 'vin'
   doc["vehicle_id"] = vehicle_id;
+  doc["vin"]        = vehicle_id;
+
   if (!isnan(batt))      doc["batt"]      = batt;
   if (!isnan(coolant))   doc["coolant"]   = coolant;
   if (!isnan(rpm))       doc["rpm"]       = rpm;
@@ -134,7 +132,6 @@ static bool postSensorData(
   String payload; serializeJson(doc, payload);
   return supabasePostJson(SENSOR_PATH, payload);
 }
-
 static String toHexBytes(const uint8_t* data, uint8_t len) {
   char buf[3];
   String s;
@@ -145,8 +142,6 @@ static String toHexBytes(const uint8_t* data, uint8_t len) {
   }
   return s;
 }
-
-// Batch-post raw frames to public.can_raw in smaller chunks (saves heap)
 static bool postRawFramesBatch(const Frame* frames, int count) {
   int sent = 0;
   while (sent < count) {
@@ -157,6 +152,7 @@ static bool postRawFramesBatch(const Frame* frames, int count) {
       const Frame& fr = frames[sent + i];
       JsonObject r = arr.createNestedObject();
       r["vehicle_id"] = vehicle_id;
+      r["vin"]        = vehicle_id;               // store VIN in its own column too
       r["can_id"]     = (int)fr.id;
       r["is_ext"]     = fr.is_ext;
       r["dlc"]        = (int)fr.dlc;
@@ -171,12 +167,12 @@ static bool postRawFramesBatch(const Frame* frames, int count) {
   return true;
 }
 
-// ---------------- OBD-II decoders ----------------
-static float decodeTemp(uint8_t A){ return (float)A - 40.0f; }                     // PID 05 (°C)
-static float decodeRPM(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/4.0f; }         // PID 0C (rpm)
-static float decodeVoltage(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/1000.0f; }  // PID 42 (V)
-static float decodeTrim(uint8_t A){ return ((float)A - 128.0f) * 100.0f / 128.0f; }// 06–09 (%)
-static long  decodeU16(uint8_t A,uint8_t B){ return (long)(A*256 + B); }           // PID 1F (s)
+// ---------------- OBD decoders ----------------
+static float decodeTemp(uint8_t A){ return (float)A - 40.0f; }
+static float decodeRPM(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/4.0f; }
+static float decodeVoltage(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/1000.0f; }
+static float decodeTrim(uint8_t A){ return ((float)A - 128.0f) * 100.0f / 128.0f; }
+static long  decodeU16(uint8_t A,uint8_t B){ return (long)(A*256 + B); }
 
 // ---------------- VIN (Mode 09 PID 02) ----------------
 // Handles ISO-TP multi-frame and 49 02 01/02/03 replies
@@ -264,9 +260,7 @@ static void requestVIN() {
   }
 }
 
-// ---------------- OBD-II request/parse ----------------
-// NOTE: We no longer push TX frames into the raw buffer; RX only.
-// Also increments rx_count when any reply is received.
+// ---------------- PID request/parse (RX-only buffer) ----------------
 static void requestPID(uint8_t pid, Frame* out, int& idx, int max,
                        float& batt, float& coolant, float& rpm,
                        float& stft_b1, float& ltft_b1, float& stft_b2, float& ltft_b2,
@@ -283,12 +277,11 @@ static void requestPID(uint8_t pid, Frame* out, int& idx, int max,
   tx.data[2] = pid;                     // PID
   tx.data[3] = tx.data[4] = tx.data[5] = tx.data[6] = tx.data[7] = 0x00;
 
-  if (twai_transmit(&tx, pdMS_TO_TICKS(50)) == ESP_OK) {
-    Serial.printf("📤 Sent STD PID 0x%02X on ID 0x7DF\n", pid);
-  } else {
+  if (twai_transmit(&tx, pdMS_TO_TICKS(50)) != ESP_OK) {
     Serial.printf("TX failed for PID 0x%02X\n", pid);
     return;
   }
+  Serial.printf("📤 Sent STD PID 0x%02X on ID 0x7DF\n", pid);
 
   // Collect responses (typ. 0x7E8..0x7EF). Wait ~60 ms.
   uint32_t t0 = millis();
@@ -296,7 +289,7 @@ static void requestPID(uint8_t pid, Frame* out, int& idx, int max,
     twai_message_t rx;
     if (twai_receive(&rx, pdMS_TO_TICKS(5)) == ESP_OK) {
       Frame f; pushFromMsg(f, rx);
-      out[idx++] = f;         // <-- RX only
+      out[idx++] = f;         // RX only
       rx_count++;             // mark that ECUs are awake
 
       // Positive response: 0x41; PID echoes in byte 2
@@ -325,7 +318,7 @@ static void requestPID(uint8_t pid, Frame* out, int& idx, int max,
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\nOLADS OBD-II poller → Supabase (ignition-aware)");
+  Serial.println("\nOLADS OBD-II poller → Supabase (VIN as vehicle_id)");
 
   wifiConnect();
   secureClient.setInsecure();   // dev: skip CA; for prod, pin Let's Encrypt R3
@@ -336,7 +329,7 @@ void setup() {
   }
   Serial.println("CAN NORMAL @ 500 kbps");
 
-  // We will call requestVIN() later the first time we detect replies.
+  // We’ll request VIN after we first see ECU replies.
 }
 
 void loop() {
@@ -361,14 +354,14 @@ void loop() {
   Serial.printf("VIN=%s  RX=%d  RPM=%.0f  Coolant=%.1f°C  Batt=%.2fV  Runtime=%lds  STFT1=%.1f%%  LTFT1=%.1f%%  STFT2=%.1f%%  LTFT2=%.1f%%\n",
     vehicle_id.c_str(), rx_count, rpm, coolant, batt, runtime_s, stft_b1, ltft_b1, stft_b2, ltft_b2);
 
-  // If ECUs just woke up and we don't have VIN yet, try now
+  // If ECUs are awake and we don't have VIN yet, try now
   static bool triedVIN = false;
   if (!triedVIN && rx_count > 0 && vehicle_id == "unknown") {
     triedVIN = true;
     requestVIN();
   }
 
-  // --- Send to Supabase ONLY if we got replies this loop ---
+  // Upload only if we got replies (ignition ON)
   if (rx_count > 0) {
     bool haveParsed = (!isnan(rpm) || !isnan(coolant) || !isnan(batt) ||
                        runtime_s >= 0 || !isnan(stft_b1) || !isnan(ltft_b1) ||
@@ -377,7 +370,6 @@ void loop() {
     if (haveParsed) {
       postSensorData(batt, coolant, rpm, stft_b1, ltft_b1, stft_b2, ltft_b2, runtime_s);
     }
-
     if (idx > 0) {
       postRawFramesBatch(buf, idx);  // RX-only frames
     }
@@ -388,5 +380,6 @@ void loop() {
   // Poll every ~1s
   delay(1000);
 }
+
 
 
