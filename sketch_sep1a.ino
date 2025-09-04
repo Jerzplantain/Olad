@@ -79,7 +79,7 @@ const int networkCount  = sizeof(ssids) / sizeof(ssids[0]);
 // ===== Supabase =====
 String serverUrl   = "https://zhrlppnknfjxhwhfsdxd.supabase.co/rest/v1/sensor_data";
 String rawUrl      = "https://zhrlppnknfjxhwhfsdxd.supabase.co/rest/v1/can_raw";
-String SUPABASE_KEY= "<YOUR_SUPABASE_KEY>";
+String SUPABASE_KEY= "<eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU>";
 String vehicle_id  = "NJ test facility 01";
 
 // ===== Pins =====
