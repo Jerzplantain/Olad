@@ -11,8 +11,8 @@
 #include <ctype.h>
 
 // ---------- EDIT (Wi-Fi) ----------
-const char* WIFI_SSID = "YOUR_WIFI";
-const char* WIFI_PASS = "YOUR_PASS";
+const char* WIFI_SSID = "iPhone";
+const char* WIFI_PASS = "american";
 
 // ===== Supabase (REST) =====
 String serverUrl    = "https://zhrlppnknfjxhwhfsdxd.supabase.co/rest/v1/sensor_data"; // parsed PIDs
@@ -148,8 +148,7 @@ static float decodeVoltage(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/1000.0f; 
 static float decodeTrim(uint8_t A){ return ((float)A - 128.0f) * 100.0f / 128.0f; }// PIDs 06–09 (%)
 static long  decodeU16(uint8_t A,uint8_t B){ return (long)(A*256 + B); }           // PID 1F (s)
 
-// ---------------- VIN (Mode 09 PID 02) ----------------
-// Collects VIN characters from 0x7E8..0x7EF replies containing 0x49 0x02
+// Reassembles VIN from both ISO-TP multi-frame and 49 02 chunked replies
 static void requestVIN() {
   twai_message_t tx = {};
   tx.identifier = 0x7DF;
@@ -167,34 +166,76 @@ static void requestVIN() {
     return;
   }
 
-  // Gather for up to 300ms (some ECUs send multiple frames)
+  char vinbuf[32]; uint8_t vinlen = 0;
+  // For 49 02 01/02/03 style
+  char partBuf[3][8]; uint8_t partLen[3] = {0,0,0}; bool gotPart[3] = {false,false,false};
+  bool sawISOTP = false;
+
   uint32_t t0 = millis();
-  String vinChars = "";
-  while (millis() - t0 < 300) {
+  while (millis() - t0 < 1200) {  // give ECUs time to stream
     twai_message_t rx;
-    if (twai_receive(&rx, pdMS_TO_TICKS(10)) == ESP_OK) {
-      // Positive response to 09 02 is: 0x49, 0x02, ...
-      if (rx.data_length_code >= 3 && rx.data[1] == 0x49 && rx.data[2] == 0x02) {
-        // Append printable ASCII from bytes after the first 3
-        for (int i = 3; i < rx.data_length_code; i++) {
-          char c = (char)rx.data[i];
-          if (isprint((unsigned char)c)) vinChars += c;
+    if (twai_receive(&rx, pdMS_TO_TICKS(20)) != ESP_OK) continue;
+
+    const uint8_t *d = rx.data;
+    uint8_t dlc = rx.data_length_code;
+
+    if (dlc < 3) continue;
+
+    // ISO-TP First Frame? (0x10 to 0x1F in high nibble)
+    if ( (d[0] & 0xF0) == 0x10 && dlc >= 6 ) {
+      // d[0:1] total len, then payload starts at d[2]
+      // Expect d[2]=0x49, d[3]=0x02, d[4]=0x01 then VIN bytes from d[5..]
+      if (d[2] == 0x49 && d[3] == 0x02) {
+        sawISOTP = true;
+        for (uint8_t i = 5; i < dlc && vinlen < 31; i++) {
+          char c = (char)d[i];
+          if (c >= ' ' && c <= '~') vinbuf[vinlen++] = c;
         }
       }
+      continue;
+    }
+
+    // ISO-TP Consecutive Frame? (0x21..0x2F)
+    if ( (d[0] & 0xF0) == 0x20 && dlc >= 2 ) {
+      if (sawISOTP) {
+        for (uint8_t i = 1; i < dlc && vinlen < 31; i++) {
+          char c = (char)d[i];
+          if (c >= ' ' && c <= '~') vinbuf[vinlen++] = c;
+        }
+      }
+      continue;
+    }
+
+    // ELM-style single-chunk replies: 49 02 01/02/03 in d[1], d[2], d[3]
+    if (dlc >= 4 && d[1] == 0x49 && d[2] == 0x02) {
+      uint8_t part = d[3];               // 0x01..0x03
+      if (part >= 1 && part <= 3) {
+        uint8_t idx = part - 1;
+        uint8_t start = 4;
+        uint8_t len = dlc > start ? (dlc - start) : 0;
+        if (len > 7) len = 7;
+        for (uint8_t i=0; i<len; i++) partBuf[idx][i] = (char)d[start+i];
+        partLen[idx] = len; gotPart[idx] = true;
+      }
+      continue;
     }
   }
 
-  // Clean up (remove spaces/nulls) and sanity check
-  vinChars.trim();
-  String filtered = "";
-  for (size_t i=0;i<vinChars.length();i++) {
-    char c = vinChars[i];
-    if (c != ' ' && c != '\0' && c != '\r' && c != '\n') filtered += c;
+  String vin;
+  if (sawISOTP) {
+    // ISO-TP path wins if we got it
+    vin.reserve(vinlen);
+    for (uint8_t i=0;i<vinlen;i++) if (vinbuf[i] != ' ') vin += vinbuf[i];
+  } else {
+    // Stitch 49 02 01/02/03
+    for (uint8_t p=0; p<3; p++) if (gotPart[p]) {
+      for (uint8_t i=0; i<partLen[p]; i++) if (partBuf[p][i] != ' ') vin += partBuf[p][i];
+    }
   }
 
-  if (filtered.length() >= 11) { // many ECUs will give all 17; accept if mostly there
-    if (filtered.length() > 17) filtered = filtered.substring(0, 17);
-    vehicle_id = filtered;
+  if (vin.length() >= 17) vin = vin.substring(0, 17);
+  if (vin.length() >= 11) {
+    vehicle_id = vin;
     Serial.printf("✅ VIN detected: %s\n", vehicle_id.c_str());
   } else {
     Serial.println("⚠ VIN not found, using default 'unknown'");
@@ -313,3 +354,4 @@ void loop() {
   // Poll every ~1s
   delay(1000);
 }
+
