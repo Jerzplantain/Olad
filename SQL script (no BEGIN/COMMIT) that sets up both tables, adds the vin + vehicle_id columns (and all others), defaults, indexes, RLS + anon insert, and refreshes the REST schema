@@ -1,0 +1,82 @@
+-- 1) Create tables if missing
+create table if not exists public.sensor_data (
+  id bigint generated always as identity primary key
+);
+
+create table if not exists public.can_raw (
+  id bigint generated always as identity primary key
+);
+
+-- 2) sensor_data: columns + defaults
+alter table public.sensor_data add column if not exists vehicle_id  text;
+alter table public.sensor_data add column if not exists vin         text;
+alter table public.sensor_data add column if not exists batt        real;
+alter table public.sensor_data add column if not exists coolant     real;
+alter table public.sensor_data add column if not exists rpm         real;
+alter table public.sensor_data add column if not exists stft_b1     real;
+alter table public.sensor_data add column if not exists ltft_b1     real;
+alter table public.sensor_data add column if not exists stft_b2     real;
+alter table public.sensor_data add column if not exists ltft_b2     real;
+alter table public.sensor_data add column if not exists runtime_s   integer;
+alter table public.sensor_data add column if not exists "timestamp" timestamptz default now();
+
+update public.sensor_data
+   set "timestamp" = now()
+ where "timestamp" is null;
+
+alter table public.sensor_data alter column "timestamp" set not null;
+
+-- Optional: backfill vehicle_id where null
+update public.sensor_data
+   set vehicle_id = coalesce(vehicle_id, 'unknown')
+ where vehicle_id is null;
+
+-- 3) can_raw: columns + defaults
+alter table public.can_raw add column if not exists vehicle_id  text;
+alter table public.can_raw add column if not exists vin         text;
+alter table public.can_raw add column if not exists can_id      integer;
+alter table public.can_raw add column if not exists is_ext      boolean default false;
+alter table public.can_raw add column if not exists dlc         smallint;
+alter table public.can_raw add column if not exists data_hex    text;
+alter table public.can_raw add column if not exists ts_ms       bigint;
+alter table public.can_raw add column if not exists created_at  timestamptz default now();
+
+update public.can_raw
+   set created_at = now()
+ where created_at is null;
+
+alter table public.can_raw alter column created_at set not null;
+
+-- 4) Indexes
+create index if not exists sensor_data_vehicle_time_idx
+  on public.sensor_data (vehicle_id, "timestamp" desc);
+
+create index if not exists sensor_data_vin_time_idx
+  on public.sensor_data (vin, "timestamp" desc);
+
+create index if not exists can_raw_vehicle_time_idx
+  on public.can_raw (vehicle_id, created_at desc);
+
+create index if not exists can_raw_vin_time_idx
+  on public.can_raw (vin, created_at desc);
+
+-- 5) RLS + anon insert policies
+alter table public.sensor_data enable row level security;
+alter table public.can_raw    enable row level security;
+
+drop policy if exists sensor_data_insert_anon on public.sensor_data;
+create policy sensor_data_insert_anon
+  on public.sensor_data
+  for insert
+  to anon
+  with check (true);
+
+drop policy if exists can_raw_insert_anon on public.can_raw;
+create policy can_raw_insert_anon
+  on public.can_raw
+  for insert
+  to anon
+  with check (true);
+
+-- 6) Refresh REST schema cache
+select pg_notify('pgrst','reload schema');
