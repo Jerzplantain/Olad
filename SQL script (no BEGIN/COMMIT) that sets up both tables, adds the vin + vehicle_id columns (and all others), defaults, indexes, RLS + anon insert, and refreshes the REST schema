@@ -1,23 +1,174 @@
--- Simple config table: one row per device_id storing VIN
-create table if not exists public.devices (
-  device_id text primary key,
-  vin text
+begin;
+
+-- ===============================
+-- 1) Base tables (create if missing)
+-- ===============================
+create table if not exists public.sensor_data (
+  id bigint generated always as identity primary key
 );
 
--- RLS: allow anon read/write (device uses anon key).
-alter table public.devices enable row level security;
+create table if not exists public.can_raw (
+  id bigint generated always as identity primary key
+);
 
-drop policy if exists devices_select_anon on public.devices;
-create policy devices_select_anon
-  on public.devices for select to anon using (true);
+-- ===============================
+-- 2) Columns + defaults (safe to rerun)
+-- ===============================
+-- sensor_data
+alter table public.sensor_data
+  add column if not exists vehicle_id   text,
+  add column if not exists vin          text,
+  add column if not exists speed_mph    real,
+  add column if not exists batt         real,
+  add column if not exists coolant      real,
+  add column if not exists rpm          real,
+  add column if not exists stft_b1      real,
+  add column if not exists ltft_b1      real,
+  add column if not exists stft_b2      real,
+  add column if not exists ltft_b2      real,
+  add column if not exists runtime_s    integer,
+  add column if not exists "timestamp"  timestamptz;
 
-drop policy if exists devices_insert_anon on public.devices;
-create policy devices_insert_anon
-  on public.devices for insert to anon with check (true);
+-- backfill + default + not null for timestamp
+update public.sensor_data
+   set "timestamp" = now()
+ where "timestamp" is null;
 
-drop policy if exists devices_update_anon on public.devices;
-create policy devices_update_anon
-  on public.devices for update to anon using (true);
+alter table public.sensor_data
+  alter column "timestamp" set default now(),
+  alter column "timestamp" set not null;
 
+-- can_raw
+alter table public.can_raw
+  add column if not exists vehicle_id  text,
+  add column if not exists vin         text,
+  add column if not exists can_id      integer,
+  add column if not exists is_ext      boolean default false,
+  add column if not exists dlc         smallint,
+  add column if not exists data_hex    text,
+  add column if not exists ts_ms       bigint,
+  add column if not exists created_at  timestamptz;
+
+-- backfill + default + not null for created_at
+update public.can_raw
+   set created_at = now()
+ where created_at is null;
+
+alter table public.can_raw
+  alter column created_at set default now(),
+  alter column created_at set not null;
+
+-- ===============================
+-- 3) Normalize VIN / vehicle_id (uppercase, trim, fallback)
+--    Trigger is shared by both tables.
+-- ===============================
+create or replace function public.normalize_vehicle_fields()
+returns trigger
+language plpgsql
+as $$
+begin
+  -- uppercase + trim VIN
+  if new.vin is not null then
+    new.vin := upper(trim(new.vin));
+  end if;
+
+  -- vehicle_id falls back to VIN if blank/null, then uppercase/trim
+  if coalesce(new.vehicle_id,'') = '' then
+    new.vehicle_id := coalesce(new.vin, new.vehicle_id);
+  end if;
+
+  if new.vehicle_id is not null then
+    new.vehicle_id := upper(trim(new.vehicle_id));
+  end if;
+
+  return new;
+end
+$$;
+
+drop trigger if exists normalize_vehicle_fields_sensor on public.sensor_data;
+create trigger normalize_vehicle_fields_sensor
+before insert or update on public.sensor_data
+for each row execute function public.normalize_vehicle_fields();
+
+drop trigger if exists normalize_vehicle_fields_canraw on public.can_raw;
+create trigger normalize_vehicle_fields_canraw
+before insert or update on public.can_raw
+for each row execute function public.normalize_vehicle_fields();
+
+-- Backfill existing rows to normalized form
+update public.sensor_data
+   set vin = upper(trim(vin)),
+       vehicle_id = upper(trim(coalesce(vehicle_id, vin, 'UNKNOWN')));
+
+update public.can_raw
+   set vin = upper(trim(vin)),
+       vehicle_id = upper(trim(coalesce(vehicle_id, vin, 'UNKNOWN')));
+
+-- ===============================
+-- 4) Indexes for fast reads
+-- ===============================
+create index if not exists sensor_data_vin_time_idx
+  on public.sensor_data (vin, "timestamp" desc);
+
+create index if not exists sensor_data_vehicle_time_idx
+  on public.sensor_data (vehicle_id, "timestamp" desc);
+
+create index if not exists can_raw_vin_time_idx
+  on public.can_raw (vin, created_at desc);
+
+create index if not exists can_raw_vehicle_time_idx
+  on public.can_raw (vehicle_id, created_at desc);
+
+-- ===============================
+-- 5) RLS + anon insert policies (device uses anon key)
+-- ===============================
+alter table public.sensor_data enable row level security;
+alter table public.can_raw    enable row level security;
+
+drop policy if exists sensor_data_insert_anon on public.sensor_data;
+create policy sensor_data_insert_anon
+  on public.sensor_data
+  for insert
+  to anon
+  with check (true);
+
+drop policy if exists can_raw_insert_anon on public.can_raw;
+create policy can_raw_insert_anon
+  on public.can_raw
+  for insert
+  to anon
+  with check (true);
+
+-- (Optional) allow anon SELECT for debugging in PostgREST; comment out if not desired
+drop policy if exists sensor_data_select_anon on public.sensor_data;
+create policy sensor_data_select_anon
+  on public.sensor_data
+  for select
+  to anon
+  using (true);
+
+drop policy if exists can_raw_select_anon on public.can_raw;
+create policy can_raw_select_anon
+  on public.can_raw
+  for select
+  to anon
+  using (true);
+
+-- ===============================
+-- 6) Convenience view: latest row per VIN
+-- ===============================
+create or replace view public.sensor_latest as
+select distinct on (coalesce(vin, vehicle_id, 'UNKNOWN'))
+  id, vin, vehicle_id, speed_mph, batt, coolant, rpm,
+  stft_b1, ltft_b1, stft_b2, ltft_b2, runtime_s, "timestamp"
+from public.sensor_data
+order by coalesce(vin, vehicle_id, 'UNKNOWN'), "timestamp" desc;
+
+-- ===============================
+-- 7) Refresh PostgREST schema cache
+-- ===============================
 select pg_notify('pgrst','reload schema');
+
+commit;
+
 
