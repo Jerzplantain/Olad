@@ -1,0 +1,64 @@
+-- 1) Add speed_kph to parsed readings
+alter table public.sensor_data
+  add column if not exists speed_kph real;
+
+-- 2) Snapshot view: latest reading per VIN (now includes speed_kph)
+create or replace view public.v_latest_sensor as
+select distinct on (vin)
+  vin,
+  vehicle_id,
+  speed_kph,
+  batt, coolant, rpm,
+  stft_b1, ltft_b1, stft_b2, ltft_b2,
+  runtime_s,
+  "timestamp"
+from public.sensor_data
+where vin is not null and vin <> ''
+order by vin, "timestamp" desc;
+
+-- Helpful index (likely already present)
+create index if not exists sensor_data_vin_time_idx
+  on public.sensor_data (vin, "timestamp" desc);
+
+-- 3) Daily rollup: includes avg/max speed
+drop materialized view if exists public.mv_sensor_daily;
+
+create materialized view public.mv_sensor_daily as
+select
+  vin,
+  date_trunc('day', "timestamp")::date as day,
+  avg(speed_kph)    as avg_speed_kph,
+  max(speed_kph)    as max_speed_kph,
+  avg(batt)         as avg_batt,
+  avg(rpm)          as avg_rpm,
+  max(coolant)      as max_coolant,
+  avg(stft_b1)      as avg_stft_b1,
+  avg(ltft_b1)      as avg_ltft_b1,
+  avg(stft_b2)      as avg_stft_b2,
+  avg(ltft_b2)      as avg_ltft_b2,
+  count(*)          as samples
+from public.sensor_data
+where vin is not null and vin <> ''
+group by 1,2;
+
+-- Unique index required for CONCURRENT refreshes
+create unique index if not exists mv_sensor_daily_uniq
+  on public.mv_sensor_daily (vin, day);
+
+-- Handy lookup index
+create index if not exists mv_sensor_daily_vin_day_idx
+  on public.mv_sensor_daily (vin, day desc);
+
+-- Initial refresh
+refresh materialized view concurrently public.mv_sensor_daily;
+
+-- 4) (Optional) schedule auto-refresh every 5 minutes via pg_cron
+create extension if not exists pg_cron;
+select cron.schedule(
+  'refresh_mv_sensor_daily_5min',
+  '*/5 * * * *',
+  $$ refresh materialized view concurrently public.mv_sensor_daily; $$
+);
+
+-- 5) Tell PostgREST to reload its schema cache so REST sees speed_kph & updated views
+select pg_notify('pgrst','reload schema');
