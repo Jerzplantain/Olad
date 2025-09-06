@@ -1,5 +1,4 @@
-// ==== ESP32 OBD-II PID poller → Supabase (VIN fix: ISO-TP FC + 29-bit fallback) ====
-// Features: VIN as vehicle_id, speed_mph only, ignition-aware uploads, RX-only raw logging
+// ==== ESP32 OBD-II PID poller → Supabase (VIN fix: ISO-TP FC + 29-bit fallback, mph only) ====
 // CAN pins: GPIO22 -> CTX, GPIO21 -> CRX  |  Bus: 500 kbps (OBD-II)
 
 #include <Arduino.h>
@@ -15,10 +14,10 @@
 const char* WIFI_SSID = "YOUR_WIFI";
 const char* WIFI_PASS = "YOUR_PASS";
 
-// ===== Supabase (host+path form for SNI reliability) =====
+// ===== Supabase (host+path for SNI reliability) =====
 const char* SUPABASE_HOST = "zhrlppnknfjxhwhfsdxd.supabase.co";
-const char* SENSOR_PATH   = "/rest/v1/sensor_data";   // parsed PIDs table
-const char* RAW_PATH      = "/rest/v1/can_raw";       // raw CAN table
+const char* SENSOR_PATH   = "/rest/v1/sensor_data";   // parsed readings
+const char* RAW_PATH      = "/rest/v1/can_raw";       // raw frames
 String SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU";
 
 // VIN becomes our vehicle_id once detected
@@ -185,78 +184,70 @@ static long  decodeU16(uint8_t A,uint8_t B){ return (long)(A*256 + B); }
 static float decodeSpeedMPH(uint8_t A){ return ((float)A) * 0.621371f; } // PID 0x0D km/h -> mph
 
 // ---------------- VIN helpers (ISO-TP + fallbacks) ----------------
-static void appendAscii(String& out, const uint8_t* b, int n) {
-  for (int i=0;i<n;i++) { char c=(char)b[i]; if (c>=' ' && c<='~' && c!=' ') out += c; }
-}
 static bool sendFlowControl(uint32_t req_id, bool is_ext) {
-  // ISO-TP FC: 0x30 (Continue To Send), block size=0 (unlimited), STmin=0
+  // ISO-TP FC: 0x30 (Continue To Send), block size=0, STmin=0
   uint8_t fc[8] = {0x30, 0x00, 0x00, 0,0,0,0,0};
   return canSend(req_id, is_ext, fc, 8);
 }
 
-// Assemble VIN from an ISO-TP multi-frame *physical* response stream
+// ISO-TP multi-frame *physical* read for VIN (Mode 09 PID 02)
 static String isoTpReadVINPhysical(uint32_t req_id, uint32_t resp_id, bool is_ext) {
-  // 1) Send request: 02 09 02 00 00 00 00 00
   uint8_t req[8] = {0x02, 0x09, 0x02, 0,0,0,0,0};
   if (!canSend(req_id, is_ext, req, 8)) return String();
 
-  // 2) Wait for First Frame / Single Frame
   uint8_t payload[96]; int plen=0; bool gotFF=false, done=false;
   uint32_t t0 = millis();
   while (millis()-t0 < 150) {
     twai_message_t rx;
     if (twai_receive(&rx, pdMS_TO_TICKS(20)) != ESP_OK) continue;
-    if (rx.identifier != resp_id || ((rx.flags & TWAI_MSG_FLAG_EXTD)?!is_ext:is_ext)) continue;
+    if (rx.identifier != resp_id) continue;
+    bool rx_ext = (rx.flags & TWAI_MSG_FLAG_EXTD);
+    if (rx_ext != is_ext) continue;
 
     const uint8_t* d = rx.data; uint8_t dlc = rx.data_length_code;
     if (dlc < 3) continue;
 
-    // Single Frame (PCI nibble 0x0): d[0] = 0x0L where L=payload length
+    // Single Frame
     if ( (d[0] & 0xF0) == 0x00 ) {
-      // Expect payload starts at d[1], includes 0x49 0x02 0x01 ...
       int len = (d[0] & 0x0F);
       for (int i=1;i<dlc && plen < (int)sizeof(payload) && (i-1)<len;i++) payload[plen++] = d[i];
       done = true;
       break;
     }
 
-    // First Frame (PCI nibble 0x1): d[0]=0x1N, d[1]=total_len_LSB
+    // First Frame
     if ( (d[0] & 0xF0) == 0x10 && dlc >= 6 ) {
       gotFF = true;
-      // Copy bytes after FF header (from index 2?)
-      // For OBD mode09, data starts at d[2]: 0x49 0x02 0x01 ...
       for (int i=2;i<dlc && plen < (int)sizeof(payload); i++) payload[plen++] = d[i];
-      // Send Flow Control back on *request* ID
       sendFlowControl(req_id, is_ext);
       break;
     }
   }
-  if (!gotFF && !done) {
-    // nothing useful
-    return String();
-  }
+  if (!gotFF && !done) return String();
 
-  // 3) If multi-frame, collect Consecutive Frames (0x2n)
+  // Consecutive Frames
   if (gotFF) {
     uint32_t t1 = millis();
     while (millis()-t1 < 600 && plen < (int)sizeof(payload)) {
       twai_message_t rx;
       if (twai_receive(&rx, pdMS_TO_TICKS(25)) != ESP_OK) continue;
-      if (rx.identifier != resp_id || ((rx.flags & TWAI_MSG_FLAG_EXTD)?!is_ext:is_ext)) continue;
+      if (rx.identifier != resp_id) continue;
+      bool rx_ext = (rx.flags & TWAI_MSG_FLAG_EXTD);
+      if (rx_ext != is_ext) continue;
+
       const uint8_t* d = rx.data; uint8_t dlc = rx.data_length_code;
       if ((d[0] & 0xF0) == 0x20 && dlc >= 2) {
         for (int i=1;i<dlc && plen < (int)sizeof(payload); i++) payload[plen++] = d[i];
-        // Heuristic stop once we have enough bytes after header (17 VIN chars + header ~ 3)
-        if (plen >= 24) break;
+        if (plen >= 24) break; // enough for 17 ASCII VIN (+header)
       }
     }
   }
 
-  // 4) Parse payload: expect 0x49 0x02 0x01 then ASCII VIN bytes
+  // Parse payload for 49 02 01 ... ASCII VIN
   String vin;
   for (int i=0;i<plen; i++) {
     if (i+3 <= plen && payload[i]==0x49 && payload[i+1]==0x02) {
-      int j = i+3; // skip 49 02 01
+      int j = i+3;
       while (j < plen && (int)vin.length() < 17) {
         char c = (char)payload[j++];
         if (c>=' ' && c<='~' && c!=' ') vin += c;
@@ -269,7 +260,7 @@ static String isoTpReadVINPhysical(uint32_t req_id, uint32_t resp_id, bool is_ex
   return String();
 }
 
-// Functional (0x7DF) best-effort: some ECUs reply as 49 02 01/02/03 single frames
+// Functional (0x7DF) best-effort: some ECUs reply 49 02 01/02/03 as singles
 static String functionalReadVIN11bit() {
   uint8_t req[8] = {0x02,0x09,0x02,0,0,0,0,0};
   if (!canSend(0x7DF, false, req, 8)) return String();
@@ -396,7 +387,7 @@ void loop() {
   Serial.printf("VIN=%s  RX=%d  Speed=%.0f mph  RPM=%.0f  Coolant=%.1f°C  Batt=%.2fV  Runtime=%lds  STFT1=%.1f%%  LTFT1=%.1f%%  STFT2=%.1f%%  LTFT2=%.1f%%\n",
     vehicle_id.c_str(), rx_count, speed_mph, rpm, coolant, batt, runtime_s, stft_b1, ltft_b1, stft_b2, ltft_b2);
 
-  // Try VIN once we know ECUs are awake
+  // Try VIN once ECUs are awake (do this once)
   static bool triedVIN = false;
   if (!triedVIN && rx_count > 0 && vehicle_id == "unknown") {
     triedVIN = true;
@@ -422,3 +413,4 @@ void loop() {
 
   delay(1000); // ~1 Hz
 }
+
