@@ -1,28 +1,17 @@
 begin;
 
--- Ensure base tables exist
-create table if not exists public.sensor_data (
-  id bigint generated always as identity primary key
-);
-create table if not exists public.can_raw (
-  id bigint generated always as identity primary key
-);
-
--- sensor_data: columns (safe to re-run)
+-- 0) Ensure sensor_data has every column the new view will reference
 alter table public.sensor_data
-  add column if not exists vehicle_id        text,
   add column if not exists vin               text,
-  add column if not exists batt              real,
-  add column if not exists coolant           real,   -- °C
-  add column if not exists coolant_f         real,   -- °F
+  add column if not exists vehicle_id        text,
+  add column if not exists "timestamp"       timestamptz,
   add column if not exists rpm               real,
-  add column if not exists runtime_s         integer,
-  add column if not exists stft_b1           real,
-  add column if not exists ltft_b1           real,
-  add column if not exists stft_b2           real,
-  add column if not exists ltft_b2           real,
   add column if not exists speed_kph         real,
   add column if not exists speed_mph         real,
+  add column if not exists coolant           real,   -- °C
+  add column if not exists coolant_f         real,   -- °F
+  add column if not exists batt              real,
+  add column if not exists runtime_s         integer,
   add column if not exists load_pct          real,
   add column if not exists maf_gps           real,
   add column if not exists map_kpa           real,
@@ -30,6 +19,10 @@ alter table public.sensor_data
   add column if not exists tps_pct           real,
   add column if not exists baro_kpa          real,
   add column if not exists lambda_cmd        real,
+  add column if not exists stft_b1           real,
+  add column if not exists ltft_b1           real,
+  add column if not exists stft_b2           real,
+  add column if not exists ltft_b2           real,
   add column if not exists af_lambda_b1s1    real,
   add column if not exists cat_b1s1_c        real,
   add column if not exists cat_b1s2_c        real,
@@ -39,7 +32,6 @@ alter table public.sensor_data
   add column if not exists fuel_rate_lph     real,
   add column if not exists fuel_level_pct    real,
   add column if not exists ethanol_pct       real,
-  -- misfire signals
   add column if not exists misfire_index     real,
   add column if not exists misfire_alert     boolean,
   add column if not exists dtc_csv           text,
@@ -50,10 +42,9 @@ alter table public.sensor_data
   add column if not exists misfire_cyl5      smallint,
   add column if not exists misfire_cyl6      smallint,
   add column if not exists misfire_cyl7      smallint,
-  add column if not exists misfire_cyl8      smallint,
-  add column if not exists "timestamp"       timestamptz;
+  add column if not exists misfire_cyl8      smallint;
 
--- Give timestamp a default + backfill nulls
+-- Backfill + default on timestamp
 update public.sensor_data
    set "timestamp" = now()
  where "timestamp" is null;
@@ -62,53 +53,12 @@ alter table public.sensor_data
   alter column "timestamp" set default now(),
   alter column "timestamp" set not null;
 
--- Helpful indexes
-create index if not exists sensor_data_vin_time_idx
-  on public.sensor_data (vin, "timestamp" desc);
-create index if not exists sensor_data_vehicle_time_idx
-  on public.sensor_data (vehicle_id, "timestamp" desc);
-
--- can_raw: ensure expected columns
-alter table public.can_raw
-  add column if not exists vehicle_id  text,
-  add column if not exists vin         text,
-  add column if not exists can_id      integer,
-  add column if not exists is_ext      boolean default false,
-  add column if not exists dlc         smallint,
-  add column if not exists data_hex    text,
-  add column if not exists ts_ms       bigint,
-  add column if not exists created_at  timestamptz not null default now();
-
-create index if not exists can_raw_vin_time_idx
-  on public.can_raw (vin, created_at desc);
-
--- Row-level security + anon insert policies
-alter table public.sensor_data enable row level security;
-alter table public.can_raw    enable row level security;
-
-do $$
-begin
-  if not exists (
-    select 1 from pg_policies
-    where schemaname='public' and tablename='sensor_data' and policyname='sensor_data_insert_anon'
-  ) then
-    create policy sensor_data_insert_anon
-      on public.sensor_data for insert to anon with check (true);
-  end if;
-
-  if not exists (
-    select 1 from pg_policies
-    where schemaname='public' and tablename='can_raw' and policyname='can_raw_insert_anon'
-  ) then
-    create policy can_raw_insert_anon
-      on public.can_raw for insert to anon with check (true);
-  end if;
-end$$;
-
--- Optional: latest-per-VIN view (handy for dashboards)
-create or replace view public.sensor_latest as
+-- 1) Create a NEW view with the desired column order/names (VIN first)
+create or replace view public.sensor_latest_v2 as
 select distinct on (vin)
-  vin, vehicle_id, "timestamp",
+  vin,
+  vehicle_id,
+  "timestamp",
   rpm, speed_kph, speed_mph, coolant, coolant_f, batt, runtime_s,
   load_pct, maf_gps, map_kpa, iat_c, tps_pct, baro_kpa, lambda_cmd,
   stft_b1, ltft_b1, stft_b2, ltft_b2,
@@ -120,7 +70,11 @@ select distinct on (vin)
 from public.sensor_data
 order by vin, "timestamp" desc;
 
--- Refresh PostgREST schema cache
+-- 2) (optional) index to speed up queries on vin/timestamp if not present already
+create index if not exists sensor_data_vin_time_idx
+  on public.sensor_data (vin, "timestamp" desc);
+
+-- 3) Let PostgREST reload schema (so REST sees new view)
 select pg_notify('pgrst','reload schema');
 
 commit;
