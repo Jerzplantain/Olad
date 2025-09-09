@@ -1,64 +1,98 @@
--- 1) Add speed_kph to parsed readings
-alter table public.sensor_data
-  add column if not exists speed_kph real;
+begin;
 
--- 2) Snapshot view: latest reading per VIN (now includes speed_kph)
-create or replace view public.v_latest_sensor as
-select distinct on (vin)
-  vin,
-  vehicle_id,
-  speed_kph,
-  batt, coolant, rpm,
-  stft_b1, ltft_b1, stft_b2, ltft_b2,
-  runtime_s,
-  "timestamp"
-from public.sensor_data
-where vin is not null and vin <> ''
-order by vin, "timestamp" desc;
-
--- Helpful index (likely already present)
-create index if not exists sensor_data_vin_time_idx
-  on public.sensor_data (vin, "timestamp" desc);
-
--- 3) Daily rollup: includes avg/max speed
-drop materialized view if exists public.mv_sensor_daily;
-
-create materialized view public.mv_sensor_daily as
-select
-  vin,
-  date_trunc('day', "timestamp")::date as day,
-  avg(speed_kph)    as avg_speed_kph,
-  max(speed_kph)    as max_speed_kph,
-  avg(batt)         as avg_batt,
-  avg(rpm)          as avg_rpm,
-  max(coolant)      as max_coolant,
-  avg(stft_b1)      as avg_stft_b1,
-  avg(ltft_b1)      as avg_ltft_b1,
-  avg(stft_b2)      as avg_stft_b2,
-  avg(ltft_b2)      as avg_ltft_b2,
-  count(*)          as samples
-from public.sensor_data
-where vin is not null and vin <> ''
-group by 1,2;
-
--- Unique index required for CONCURRENT refreshes
-create unique index if not exists mv_sensor_daily_uniq
-  on public.mv_sensor_daily (vin, day);
-
--- Handy lookup index
-create index if not exists mv_sensor_daily_vin_day_idx
-  on public.mv_sensor_daily (vin, day desc);
-
--- Initial refresh
-refresh materialized view concurrently public.mv_sensor_daily;
-
--- 4) (Optional) schedule auto-refresh every 5 minutes via pg_cron
-create extension if not exists pg_cron;
-select cron.schedule(
-  'refresh_mv_sensor_daily_5min',
-  '*/5 * * * *',
-  $$ refresh materialized view concurrently public.mv_sensor_daily; $$
+-- Ensure tables exist
+create table if not exists public.sensor_data (
+  id bigint generated always as identity primary key
+);
+create table if not exists public.can_raw (
+  id bigint generated always as identity primary key
 );
 
--- 5) Tell PostgREST to reload its schema cache so REST sees speed_kph & updated views
+-- sensor_data: add/ensure columns (safe to re-run)
+alter table public.sensor_data
+  add column if not exists vehicle_id        text,
+  add column if not exists vin               text,
+  add column if not exists batt              real,
+  add column if not exists coolant           real,
+  add column if not exists rpm               real,
+  add column if not exists runtime_s         integer,
+  add column if not exists stft_b1           real,
+  add column if not exists ltft_b1           real,
+  add column if not exists stft_b2           real,
+  add column if not exists ltft_b2           real,
+  -- new metrics
+  add column if not exists speed_kph         real,
+  add column if not exists speed_mph         real,
+  add column if not exists load_pct          real,
+  add column if not exists maf_gps           real,
+  add column if not exists map_kpa           real,
+  add column if not exists iat_c             real,
+  add column if not exists tps_pct           real,
+  add column if not exists baro_kpa          real,
+  add column if not exists lambda_cmd        real,
+  add column if not exists af_lambda_b1s1    real,
+  add column if not exists cat_b1s1_c        real,
+  add column if not exists cat_b1s2_c        real,
+  add column if not exists cat_b2s1_c        real,
+  add column if not exists cat_b2s2_c        real,
+  add column if not exists oil_temp_c        real,
+  add column if not exists fuel_rate_lph     real,
+  add column if not exists "timestamp"       timestamptz;
+
+-- Give timestamp a default + backfill nulls
+update public.sensor_data
+   set "timestamp" = now()
+ where "timestamp" is null;
+
+alter table public.sensor_data
+  alter column "timestamp" set default now(),
+  alter column "timestamp" set not null;
+
+-- Helpful indexes
+create index if not exists sensor_data_vin_time_idx
+  on public.sensor_data (vin, "timestamp" desc);
+create index if not exists sensor_data_vehicle_time_idx
+  on public.sensor_data (vehicle_id, "timestamp" desc);
+
+-- can_raw: ensure columns used by the sketch
+alter table public.can_raw
+  add column if not exists vehicle_id  text,
+  add column if not exists vin         text,
+  add column if not exists can_id      integer,
+  add column if not exists is_ext      boolean default false,
+  add column if not exists dlc         smallint,
+  add column if not exists data_hex    text,
+  add column if not exists ts_ms       bigint,
+  add column if not exists created_at  timestamptz not null default now();
+
+create index if not exists can_raw_vin_time_idx
+  on public.can_raw (vin, created_at desc);
+
+-- RLS + insert policies for anon (ESP32 uses anon key)
+alter table public.sensor_data enable row level security;
+alter table public.can_raw    enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='sensor_data' and policyname='sensor_data_insert_anon'
+  ) then
+    create policy sensor_data_insert_anon
+      on public.sensor_data for insert to anon with check (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='can_raw' and policyname='can_raw_insert_anon'
+  ) then
+    create policy can_raw_insert_anon
+      on public.can_raw for insert to anon with check (true);
+  end if;
+end$$;
+
+-- Refresh PostgREST schema cache (fixes "schema cache" errors)
 select pg_notify('pgrst','reload schema');
+
+commit;
+
