@@ -21,7 +21,7 @@ struct Frame {
 #include <ctype.h>
 
 // ---------------- USER CONFIG ----------------
-const char* WIFI_SSID = "Galaxy";
+const char* WIFI_SSID = "iPhone";
 const char* WIFI_PASS = "american";
 
 // Supabase (host + path form)
