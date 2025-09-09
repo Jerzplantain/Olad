@@ -1,6 +1,6 @@
 begin;
 
--- Ensure tables exist
+-- Ensure base tables exist
 create table if not exists public.sensor_data (
   id bigint generated always as identity primary key
 );
@@ -8,19 +8,19 @@ create table if not exists public.can_raw (
   id bigint generated always as identity primary key
 );
 
--- sensor_data: add/ensure columns (safe to re-run)
+-- sensor_data: columns (safe to re-run)
 alter table public.sensor_data
   add column if not exists vehicle_id        text,
   add column if not exists vin               text,
   add column if not exists batt              real,
-  add column if not exists coolant           real,
+  add column if not exists coolant           real,   -- °C
+  add column if not exists coolant_f         real,   -- °F
   add column if not exists rpm               real,
   add column if not exists runtime_s         integer,
   add column if not exists stft_b1           real,
   add column if not exists ltft_b1           real,
   add column if not exists stft_b2           real,
   add column if not exists ltft_b2           real,
-  -- new metrics
   add column if not exists speed_kph         real,
   add column if not exists speed_mph         real,
   add column if not exists load_pct          real,
@@ -37,6 +37,20 @@ alter table public.sensor_data
   add column if not exists cat_b2s2_c        real,
   add column if not exists oil_temp_c        real,
   add column if not exists fuel_rate_lph     real,
+  add column if not exists fuel_level_pct    real,
+  add column if not exists ethanol_pct       real,
+  -- misfire signals
+  add column if not exists misfire_index     real,
+  add column if not exists misfire_alert     boolean,
+  add column if not exists dtc_csv           text,
+  add column if not exists misfire_cyl1      smallint,
+  add column if not exists misfire_cyl2      smallint,
+  add column if not exists misfire_cyl3      smallint,
+  add column if not exists misfire_cyl4      smallint,
+  add column if not exists misfire_cyl5      smallint,
+  add column if not exists misfire_cyl6      smallint,
+  add column if not exists misfire_cyl7      smallint,
+  add column if not exists misfire_cyl8      smallint,
   add column if not exists "timestamp"       timestamptz;
 
 -- Give timestamp a default + backfill nulls
@@ -54,7 +68,7 @@ create index if not exists sensor_data_vin_time_idx
 create index if not exists sensor_data_vehicle_time_idx
   on public.sensor_data (vehicle_id, "timestamp" desc);
 
--- can_raw: ensure columns used by the sketch
+-- can_raw: ensure expected columns
 alter table public.can_raw
   add column if not exists vehicle_id  text,
   add column if not exists vin         text,
@@ -68,7 +82,7 @@ alter table public.can_raw
 create index if not exists can_raw_vin_time_idx
   on public.can_raw (vin, created_at desc);
 
--- RLS + insert policies for anon (ESP32 uses anon key)
+-- Row-level security + anon insert policies
 alter table public.sensor_data enable row level security;
 alter table public.can_raw    enable row level security;
 
@@ -91,8 +105,22 @@ begin
   end if;
 end$$;
 
--- Refresh PostgREST schema cache (fixes "schema cache" errors)
+-- Optional: latest-per-VIN view (handy for dashboards)
+create or replace view public.sensor_latest as
+select distinct on (vin)
+  vin, vehicle_id, "timestamp",
+  rpm, speed_kph, speed_mph, coolant, coolant_f, batt, runtime_s,
+  load_pct, maf_gps, map_kpa, iat_c, tps_pct, baro_kpa, lambda_cmd,
+  stft_b1, ltft_b1, stft_b2, ltft_b2,
+  af_lambda_b1s1, cat_b1s1_c, cat_b1s2_c, cat_b2s1_c, cat_b2s2_c,
+  oil_temp_c, fuel_rate_lph, fuel_level_pct, ethanol_pct,
+  misfire_index, misfire_alert, dtc_csv,
+  misfire_cyl1, misfire_cyl2, misfire_cyl3, misfire_cyl4,
+  misfire_cyl5, misfire_cyl6, misfire_cyl7, misfire_cyl8
+from public.sensor_data
+order by vin, "timestamp" desc;
+
+-- Refresh PostgREST schema cache
 select pg_notify('pgrst','reload schema');
 
 commit;
-
