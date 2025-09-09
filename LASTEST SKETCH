@@ -7,9 +7,9 @@ struct Frame {
   bool is_ext;
 };
 
-// ==== ESP32 OBD-II PID poller → Supabase (VIN as vehicle_id + extra PIDs) ====
+// ==== ESP32 OBD-II → Supabase (mph + °F + full PID set + misfire flags/index) ====
 // Pins: ESP32 GPIO22 -> CAN TXD, GPIO21 -> CAN RXD
-// OBD-II: pin 6=CANH, pin 14=CANL, pin 5=GND (tie to board GND). Pin 4 chassis GND optional.
+// OBD-II: pin 6=CANH, pin 14=CANL, pin 5=Signal GND (tie to board GND)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -33,7 +33,7 @@ String SUPABASE_KEY       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdX
 // CAN pins and options
 #define TWAI_TX_PIN     GPIO_NUM_22
 #define TWAI_RX_PIN     GPIO_NUM_21
-#define TRANS_STB_PIN   -1     // set to a valid GPIO if your board exposes RS/STB/EN; otherwise leave -1
+#define TRANS_STB_PIN   -1     // set to a valid GPIO if your transceiver has RS/STB/EN; otherwise leave -1
 
 // Posting/queue sizes
 #define RAW_CHUNK_SIZE     32
@@ -43,7 +43,7 @@ String SUPABASE_KEY       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdX
 // Poll pacing
 #define SLOW_LOOP_EVERY    5    // run "slow" PID set every N loops
 
-// Try these Honda 29-bit ECU source addresses first
+// Candidate 29-bit ECU source addresses (Honda-friendly)
 static const uint8_t kCandidateExtECUs[] = { 0x0E, 0x10, 0x33 };
 static inline uint32_t makeExtReqId(uint8_t ecu){
   return ((uint32_t)0x18<<24)|((uint32_t)0xDA<<16)|((uint32_t)ecu<<8)|0xF1;
@@ -55,6 +55,30 @@ String vehicle_id = "unknown";
 // ---------------- GLOBALS ----------------
 WiFiClientSecure secureClient;
 HTTPClient http;
+
+// --- simple rolling stats for “misfire_index” ---
+static const int STAT_N = 16;
+static float rpm_hist[STAT_N];     // filled with NAN initially
+static float stft_hist[STAT_N];
+static int   stat_idx = 0;
+static bool  stat_inited = false;
+static inline void stat_push(float rpm, float stft){
+  if (!stat_inited) {
+    for (int i=0;i<STAT_N;i++){ rpm_hist[i]=NAN; stft_hist[i]=NAN; }
+    stat_inited = true;
+  }
+  rpm_hist[stat_idx]  = rpm;
+  stft_hist[stat_idx] = stft;
+  stat_idx = (stat_idx + 1) % STAT_N;
+}
+static void stat_mean_std(const float* v, float& mean, float& stddev){
+  int n=0; mean=0; stddev=0;
+  for (int i=0;i<STAT_N;i++){ if (!isnan(v[i])){ mean += v[i]; n++; } }
+  if (n==0){ mean=NAN; stddev=NAN; return; }
+  mean /= n;
+  float acc=0; for (int i=0;i<STAT_N;i++){ if (!isnan(v[i])){ float d=v[i]-mean; acc += d*d; } }
+  stddev = sqrtf(acc / n);
+}
 
 // ---------------- WIFI ----------------
 static bool wifiConnect() {
@@ -94,7 +118,7 @@ static bool canInstallStart(twai_mode_t mode){
 }
 static bool canInitNormal() { return canInstallStart(TWAI_MODE_NORMAL); }
 
-// Helper to convert TWAI msg -> Frame
+// Copy TWAI → Frame
 static inline void pushFromMsg(Frame& dst, const twai_message_t& m) {
   dst.ts  = millis();
   bool ext = (m.flags & TWAI_MSG_FLAG_EXTD);
@@ -155,18 +179,19 @@ static bool postRawFramesBatch(const Frame* frames, int count) {
 }
 
 // ---------------- Decoders ----------------
-static float decodeTemp(uint8_t A){ return (float)A - 40.0f; }
-static float decodeRPM(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/4.0f; }
-static float decodeVoltage(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/1000.0f; }
-static float decodeTrim(uint8_t A){ return ((float)A - 128.0f) * 100.0f / 128.0f; }
+static float decodeTempC(uint8_t A){ return (float)A - 40.0f; }                  // °C
+static float C_to_F(float c){ return isnan(c) ? NAN : (c * 9.0f/5.0f + 32.0f); } // °F
+static float decodeRPM(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/4.0f; }       // rpm
+static float decodeVoltage(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/1000.0f; } // V
+static float decodeTrim(uint8_t A){ return ((float)A - 128.0f) * 100.0f / 128.0f; } // %
 static long  decodeU16(uint8_t A,uint8_t B){ return (long)(A*256 + B); }
-static float decodePct(uint8_t A){ return (float)A * 100.0f / 255.0f; }
-static float decodeMAF(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/100.0f; }      // g/s
-static float decodeLambdaCmd(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/32768.0f; } // equivalence ratio
-static float decodeCatTemp(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/10.0f - 40.0f; } // °C
-static float decodeFuelRate(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/20.0f; }   // L/h
+static float decodePct(uint8_t A){ return (float)A * 100.0f / 255.0f; }          // %
+static float decodeMAF(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/100.0f; }     // g/s
+static float decodeLambdaCmd(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/32768.0f; } // λ
+static float decodeCatTempC(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/10.0f - 40.0f; } // °C
+static float decodeFuelRateLph(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/20.0f; } // L/h
 
-// ---------------- Address/ISO-TP helpers ----------------
+// ---------------- Address helpers ----------------
 static inline bool isDiag11(uint32_t id){ return (id>=0x7E8 && id<=0x7EF); }
 static inline bool isDiag29(uint32_t id){ return ( (id & 0x1FFF0000) == 0x18DA0000 ); }
 static inline bool isExpectedExtResp(uint32_t id){
@@ -211,7 +236,7 @@ static bool requestVIN_once(uint32_t reqId, bool ext) {
   tx.identifier = reqId;
   tx.flags = ext ? TWAI_MSG_FLAG_EXTD : TWAI_MSG_FLAG_NONE;
   tx.data_length_code = 8;
-  tx.data[0] = 0x02;  // Service 09, PID 02 (VIN)
+  tx.data[0] = 0x02;  // 09 02 = VIN
   tx.data[1] = 0x09;
   tx.data[2] = 0x02;
   for (int i=3;i<8;i++) tx.data[i]=0x00;
@@ -275,63 +300,54 @@ static void requestVIN() {
 
 // ---------------- PID request/parse ----------------
 static void parsePositivePID(uint8_t pid, const twai_message_t& rx,
-  float& batt, float& coolant, float& rpm, long& runtime_s,
+  float& batt, float& coolant_c, float& coolant_f, float& rpm, long& runtime_s,
   float& stft_b1, float& ltft_b1, float& stft_b2, float& ltft_b2,
-  // new metrics:
+  // extended set:
   float& speed_kph, float& speed_mph, float& load_pct,
   float& maf_gps, float& map_kpa, float& iat_c, float& tps_pct,
   float& baro_kpa, float& lambda_cmd,
-  float& af_lambda_b1s1,           // wideband stub (if supported)
+  float& af_lambda_b1s1,            // wideband stub
   float& cat_b1s1_c, float& cat_b1s2_c, float& cat_b2s1_c, float& cat_b2s2_c,
-  float& oil_temp_c, float& fuel_rate_lph)
+  float& oil_temp_c, float& fuel_rate_lph,
+  float& fuel_level_pct, float& ethanol_pct)
 {
   const uint8_t* d=rx.data; uint8_t dlc=rx.data_length_code;
-  if (dlc<3) return;
-  if (!(dlc>=5 && d[1]==0x41 && d[2]==pid)) return;
+  if (dlc<5 || d[1]!=0x41 || d[2]!=pid) return;
 
-  uint8_t A = (dlc>3)?d[3]:0;
-  uint8_t B = (dlc>4)?d[4]:0;
-  uint8_t C = (dlc>5)?d[5]:0;
-  uint8_t D = (dlc>6)?d[6]:0;
-  (void)C; (void)D;
+  uint8_t A=d[3], B=d[4];
 
   switch(pid){
-    // existing
-    case 0x05: coolant = decodeTemp(A); break;
-    case 0x0C: rpm     = decodeRPM(A,B); break;
-    case 0x42: batt    = decodeVoltage(A,B); break;
-    case 0x1F: runtime_s = decodeU16(A,B); break;
-    case 0x06: stft_b1 = decodeTrim(A); break;
-    case 0x07: ltft_b1 = decodeTrim(A); break;
-    case 0x08: stft_b2 = decodeTrim(A); break;
-    case 0x09: ltft_b2 = decodeTrim(A); break;
+    // core set
+    case 0x05: coolant_c = decodeTempC(A); coolant_f = C_to_F(coolant_c); break;
+    case 0x0C: rpm        = decodeRPM(A,B); break;
+    case 0x42: batt       = decodeVoltage(A,B); break;
+    case 0x1F: runtime_s  = decodeU16(A,B); break;
+    case 0x06: stft_b1    = decodeTrim(A); break;
+    case 0x07: ltft_b1    = decodeTrim(A); break;
+    case 0x08: stft_b2    = decodeTrim(A); break;
+    case 0x09: ltft_b2    = decodeTrim(A); break;
 
-    // additions
-    case 0x0D: speed_kph = (float)A; speed_mph = speed_kph * 0.621371f; break;
-    case 0x04: load_pct  = decodePct(A); break;
-    case 0x10: maf_gps   = decodeMAF(A,B); break;
-    case 0x0B: map_kpa   = (float)A; break;
-    case 0x0F: iat_c     = decodeTemp(A); break;
-    case 0x11: tps_pct   = decodePct(A); break;
-    case 0x33: baro_kpa  = (float)A; break;
+    // extended set
+    case 0x0D: speed_kph  = (float)A; speed_mph = speed_kph * 0.621371f; break;
+    case 0x04: load_pct   = decodePct(A); break;
+    case 0x10: maf_gps    = decodeMAF(A,B); break;
+    case 0x0B: map_kpa    = (float)A; break;
+    case 0x0F: iat_c      = decodeTempC(A); break;
+    case 0x11: tps_pct    = decodePct(A); break;
+    case 0x33: baro_kpa   = (float)A; break;
     case 0x44: lambda_cmd = decodeLambdaCmd(A,B); break;
 
-    // wideband lambda (PID 0x24 example; many vehicles don’t support; treat as lambda only)
-    case 0x24: // O2S1 equivalence ratio (A,B) and current/voltage (C,D)
-      af_lambda_b1s1 = decodeLambdaCmd(A,B); break;
+    case 0x24: af_lambda_b1s1 = decodeLambdaCmd(A,B); break;   // wideband (if supported)
 
-    // catalyst temps
-    case 0x3C: cat_b1s1_c = decodeCatTemp(A,B); break;
-    case 0x3D: cat_b2s1_c = decodeCatTemp(A,B); break;
-    case 0x3E: cat_b1s2_c = decodeCatTemp(A,B); break;
-    case 0x3F: cat_b2s2_c = decodeCatTemp(A,B); break;
+    case 0x3C: cat_b1s1_c = decodeCatTempC(A,B); break;
+    case 0x3D: cat_b2s1_c = decodeCatTempC(A,B); break;
+    case 0x3E: cat_b1s2_c = decodeCatTempC(A,B); break;
+    case 0x3F: cat_b2s2_c = decodeCatTempC(A,B); break;
 
-    // oil temp
-    case 0x52: oil_temp_c = decodeTemp(A); break;
-
-    // fuel rate
-    case 0x5E: fuel_rate_lph = decodeFuelRate(A,B); break;
-
+    case 0x5C: oil_temp_c = decodeTempC(A); break;             // oil temp (°C)
+    case 0x5E: fuel_rate_lph = decodeFuelRateLph(A,B); break;  // L/h
+    case 0x2F: fuel_level_pct = decodePct(A); break;           // %
+    case 0x52: ethanol_pct = decodePct(A); break;              // %
     default: break;
   }
 }
@@ -342,7 +358,7 @@ static inline bool isPositiveForPid(const twai_message_t& rx, uint8_t pid){
 
 static bool requestPID_once(uint8_t pid, uint32_t reqId, bool ext,
                        Frame* out, int& idx, int max,
-                       float& batt, float& coolant, float& rpm, long& runtime_s,
+                       float& batt, float& coolant_c, float& coolant_f, float& rpm, long& runtime_s,
                        float& stft_b1, float& ltft_b1, float& stft_b2, float& ltft_b2,
                        float& speed_kph, float& speed_mph, float& load_pct,
                        float& maf_gps, float& map_kpa, float& iat_c, float& tps_pct,
@@ -350,6 +366,7 @@ static bool requestPID_once(uint8_t pid, uint32_t reqId, bool ext,
                        float& af_lambda_b1s1,
                        float& cat_b1s1_c, float& cat_b1s2_c, float& cat_b2s1_c, float& cat_b2s2_c,
                        float& oil_temp_c, float& fuel_rate_lph,
+                       float& fuel_level_pct, float& ethanol_pct,
                        int& rx_count)
 {
   if (idx >= max) return false;
@@ -385,14 +402,15 @@ static bool requestPID_once(uint8_t pid, uint32_t reqId, bool ext,
       if (isPositiveForPid(rx, pid)) {
         gotPositive = true;
         parsePositivePID(pid, rx,
-          batt, coolant, rpm, runtime_s,
+          batt, coolant_c, coolant_f, rpm, runtime_s,
           stft_b1, ltft_b1, stft_b2, ltft_b2,
           speed_kph, speed_mph, load_pct,
           maf_gps, map_kpa, iat_c, tps_pct,
           baro_kpa, lambda_cmd,
           af_lambda_b1s1,
           cat_b1s1_c, cat_b1s2_c, cat_b2s1_c, cat_b2s2_c,
-          oil_temp_c, fuel_rate_lph);
+          oil_temp_c, fuel_rate_lph,
+          fuel_level_pct, ethanol_pct);
       }
     }
   }
@@ -400,7 +418,7 @@ static bool requestPID_once(uint8_t pid, uint32_t reqId, bool ext,
 }
 
 static void requestPID_sweep(uint8_t pid, Frame* out, int& idx, int max,
-                             float& batt, float& coolant, float& rpm, long& runtime_s,
+                             float& batt, float& coolant_c, float& coolant_f, float& rpm, long& runtime_s,
                              float& stft_b1, float& ltft_b1, float& stft_b2, float& ltft_b2,
                              float& speed_kph, float& speed_mph, float& load_pct,
                              float& maf_gps, float& map_kpa, float& iat_c, float& tps_pct,
@@ -408,54 +426,157 @@ static void requestPID_sweep(uint8_t pid, Frame* out, int& idx, int max,
                              float& af_lambda_b1s1,
                              float& cat_b1s1_c, float& cat_b1s2_c, float& cat_b2s1_c, float& cat_b2s2_c,
                              float& oil_temp_c, float& fuel_rate_lph,
+                             float& fuel_level_pct, float& ethanol_pct,
                              int& rx_count)
 {
   for (uint8_t ecu : kCandidateExtECUs)
     if (requestPID_once(pid, makeExtReqId(ecu), true, out,idx,max,
-        batt,coolant,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
+        batt,coolant_c,coolant_f,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
         speed_kph,speed_mph,load_pct, maf_gps,map_kpa,iat_c,tps_pct,
         baro_kpa,lambda_cmd, af_lambda_b1s1,
-        cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph, rx_count)) return;
+        cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph,
+        fuel_level_pct,ethanol_pct, rx_count)) return;
 
   if (requestPID_once(pid, 0x7E0, false, out,idx,max,
-        batt,coolant,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
+        batt,coolant_c,coolant_f,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
         speed_kph,speed_mph,load_pct, maf_gps,map_kpa,iat_c,tps_pct,
         baro_kpa,lambda_cmd, af_lambda_b1s1,
-        cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph, rx_count)) return;
+        cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph,
+        fuel_level_pct,ethanol_pct, rx_count)) return;
 
   (void)requestPID_once(pid, 0x7DF, false, out,idx,max,
-        batt,coolant,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
+        batt,coolant_c,coolant_f,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
         speed_kph,speed_mph,load_pct, maf_gps,map_kpa,iat_c,tps_pct,
         baro_kpa,lambda_cmd, af_lambda_b1s1,
-        cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph, rx_count);
+        cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph,
+        fuel_level_pct,ethanol_pct, rx_count);
 }
 
-// ---------------- Posting parsed sensor_data ----------------
+// ---------------- DTCs (Modes 03, 07, 0A) ----------------
+static char dtcBuf[512]; // CSV buffer
+static String dtcCSV;
+
+static char dtcTypeChar(uint8_t type){ return (type==0)?'P':(type==1)?'C':(type==2)?'B':'U'; }
+static String decodeDTC(uint8_t b1, uint8_t b2){
+  if (b1==0 && b2==0) return String();
+  uint8_t type = (b1 & 0xC0) >> 6;
+  uint8_t d1   = (b1 & 0x30) >> 4;
+  uint8_t d2   = (b1 & 0x0F);
+  uint8_t d3   = (b2 & 0xF0) >> 4;
+  uint8_t d4   = (b2 & 0x0F);
+  char s[6]; snprintf(s,sizeof(s), "%c%01u%01u%01u%01u", dtcTypeChar(type), d1,d2,d3,d4);
+  return String(s);
+}
+
+static void requestDTC(uint8_t service, bool& p030_present, uint8_t misfire_cyl[8]) {
+  // clear return accumulators
+  p030_present = false;
+  for (int i=0;i<8;i++) ; // leave counts/presence accumulation to caller
+
+  // Try ext ECUs then 7E0/7DF
+  uint32_t reqs[6]; bool exts[6];
+  int r=0;
+  for (uint8_t ecu: kCandidateExtECUs){ reqs[r]=makeExtReqId(ecu); exts[r]=true; r++; }
+  reqs[r]=0x7E0; exts[r]=false; r++;
+  reqs[r]=0x7DF; exts[r]=false; r++;
+
+  uint8_t respSvc = 0x40 + service;
+  bool anyFound=false;
+
+  for (int k=0;k<r;k++){
+    uint32_t reqId=reqs[k]; bool ext=exts[k];
+
+    twai_message_t tx={};
+    tx.identifier=reqId; tx.flags = ext?TWAI_MSG_FLAG_EXTD:TWAI_MSG_FLAG_NONE; tx.data_length_code=8;
+    tx.data[0]=0x02; tx.data[1]=service; tx.data[2]=0x00; for(int i=3;i<8;i++) tx.data[i]=0x00;
+    if (twai_transmit(&tx, pdMS_TO_TICKS(60)) != ESP_OK) continue;
+
+    uint8_t agg[128]; int alen=0;
+    bool collecting=false, sawFF=false;
+    uint32_t t0=millis();
+
+    while (millis()-t0 < 600 && alen < (int)sizeof(agg)){
+      twai_message_t rx;
+      if (twai_receive(&rx, pdMS_TO_TICKS(20)) != ESP_OK) continue;
+      bool fromExpected = ext ? ((rx.flags & TWAI_MSG_FLAG_EXTD) && isExpectedExtResp(rx.identifier))
+                              : (!(rx.flags & TWAI_MSG_FLAG_EXTD) && isDiag11(rx.identifier));
+      if (!fromExpected) continue;
+      const uint8_t *d=rx.data; uint8_t dlc=rx.data_length_code;
+
+      // First frame?
+      if ((d[0] & 0xF0) == 0x10 && dlc>=4 && d[2]==respSvc){
+        sawFF=true; collecting=true; sendFlowControlToECU_forResp(rx);
+        for (int i=3;i<dlc && alen<(int)sizeof(agg); i++) agg[alen++]=d[i];
+        continue;
+      }
+      // Consecutive frame
+      if ((d[0] & 0xF0) == 0x20 && dlc>=2 && collecting){
+        for (int i=1;i<dlc && alen<(int)sizeof(agg); i++) agg[alen++]=d[i];
+        continue;
+      }
+      // Single frame
+      if ((d[0] >= 0x02 && d[0] <= 0x07) && dlc>=3 && d[1]==respSvc){
+        collecting=true;
+        for (int i=2;i<dlc && alen<(int)sizeof(agg); i++) agg[alen++]=d[i];
+        // no continue; let loop time out quickly
+      }
+    }
+
+    if (!collecting || alen==0) continue;
+    anyFound=true;
+
+    // Parse pairs into CSV
+    for (int i=0;i+1<alen; i+=2){
+      String code = decodeDTC(agg[i], agg[i+1]);
+      if (code.length()==0) continue;
+      if (dtcCSV.length()) dtcCSV += ",";
+      dtcCSV += code;
+
+      // Misfire flags from P030x
+      if (code.startsWith("P030")){
+        p030_present = true;
+        int cyl = code.substring(4).toInt(); // "P0301" -> 1
+        if (cyl>=1 && cyl<=8) misfire_cyl[cyl-1] = 1; // mark presence
+      }
+    }
+    // If we got some, stop trying other IDs to reduce load
+    if (dtcCSV.length()) break;
+  }
+}
+
+// ---------------- Post parsed sensor_data ----------------
 static bool postSensorData(
-  float batt, float coolant, float rpm, long runtime_s,
+  float batt, float coolant_c, float coolant_f, float rpm, long runtime_s,
   float stft_b1, float ltft_b1, float stft_b2, float ltft_b2,
   float speed_kph, float speed_mph, float load_pct,
   float maf_gps, float map_kpa, float iat_c, float tps_pct,
   float baro_kpa, float lambda_cmd,
   float af_lambda_b1s1,
   float cat_b1s1_c, float cat_b1s2_c, float cat_b2s1_c, float cat_b2s2_c,
-  float oil_temp_c, float fuel_rate_lph)
+  float oil_temp_c, float fuel_rate_lph,
+  float fuel_level_pct, float ethanol_pct,
+  // new misfire-related:
+  float misfire_index, bool misfire_alert,
+  const String& dtc_csv,
+  const uint8_t misfire_cyl[8])
 {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1700> doc;
   doc["vehicle_id"] = vehicle_id;
   doc["vin"]        = vehicle_id;
 
-  // existing fields
+  // core fields
   if (!isnan(batt))      doc["batt"]      = batt;
-  if (!isnan(coolant))   doc["coolant"]   = coolant;
+  if (!isnan(coolant_c)) doc["coolant"]   = coolant_c;   // °C (compat)
+  if (!isnan(coolant_f)) doc["coolant_f"] = coolant_f;   // °F
   if (!isnan(rpm))       doc["rpm"]       = rpm;
   if (runtime_s >= 0)    doc["runtime_s"] = runtime_s;
+
   if (!isnan(stft_b1))   doc["stft_b1"]   = stft_b1;
   if (!isnan(ltft_b1))   doc["ltft_b1"]   = ltft_b1;
   if (!isnan(stft_b2))   doc["stft_b2"]   = stft_b2;
   if (!isnan(ltft_b2))   doc["ltft_b2"]   = ltft_b2;
 
-  // new fields (ensure columns exist in Supabase)
+  // extended
   if (!isnan(speed_kph)) doc["speed_kph"] = speed_kph;
   if (!isnan(speed_mph)) doc["speed_mph"] = speed_mph;
   if (!isnan(load_pct))  doc["load_pct"]  = load_pct;
@@ -473,8 +594,23 @@ static bool postSensorData(
   if (!isnan(cat_b2s1_c)) doc["cat_b2s1_c"] = cat_b2s1_c;
   if (!isnan(cat_b2s2_c)) doc["cat_b2s2_c"] = cat_b2s2_c;
 
-  if (!isnan(oil_temp_c))    doc["oil_temp_c"]    = oil_temp_c;
-  if (!isnan(fuel_rate_lph)) doc["fuel_rate_lph"] = fuel_rate_lph;
+  if (!isnan(oil_temp_c))     doc["oil_temp_c"]     = oil_temp_c;
+  if (!isnan(fuel_rate_lph))  doc["fuel_rate_lph"]  = fuel_rate_lph;
+  if (!isnan(fuel_level_pct)) doc["fuel_level_pct"] = fuel_level_pct;
+  if (!isnan(ethanol_pct))    doc["ethanol_pct"]    = ethanol_pct;
+
+  // misfire-related
+  if (!isnan(misfire_index))  doc["misfire_index"]  = misfire_index;
+  doc["misfire_alert"] = misfire_alert;
+  if (dtc_csv.length())       doc["dtc_csv"]        = dtc_csv;
+
+  // per-cylinder flags if present (1..8)
+  for (int c=0;c<8;c++){
+    if (misfire_cyl[c]) {
+      char key[16]; snprintf(key,sizeof(key),"misfire_cyl%d", c+1);
+      doc[key] = (int)misfire_cyl[c];
+    }
+  }
 
   String payload; serializeJson(doc, payload);
   return supabasePostJson(SENSOR_PATH, payload);
@@ -484,7 +620,7 @@ static bool postSensorData(
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\nESP32 OBD-II → Supabase (11b+29b, ISO-TP, extended PIDs)");
+  Serial.println("\nESP32 OBD-II → Supabase (mph + °F + full PID set + misfire flags/index)");
 
   wifiConnect();
   secureClient.setInsecure();   // dev: skip CA; for prod, pin LE R3
@@ -516,38 +652,30 @@ void loop() {
   if (millis()-lastTP > 2000) { sendTesterPresent_All(); lastTP=millis(); }
 
   // Metrics
-  float batt=NAN, coolant=NAN, rpm=NAN; long runtime_s = -1;
+  float batt=NAN, coolant_c=NAN, coolant_f=NAN, rpm=NAN; long runtime_s = -1;
   float stft_b1=NAN, ltft_b1=NAN, stft_b2=NAN, ltft_b2=NAN;
 
   float speed_kph=NAN, speed_mph=NAN, load_pct=NAN;
   float maf_gps=NAN, map_kpa=NAN, iat_c=NAN, tps_pct=NAN;
   float baro_kpa=NAN, lambda_cmd=NAN, af_lambda_b1s1=NAN;
   float cat_b1s1_c=NAN, cat_b1s2_c=NAN, cat_b2s1_c=NAN, cat_b2s2_c=NAN;
-  float oil_temp_c=NAN, fuel_rate_lph=NAN;
+  float oil_temp_c=NAN, fuel_rate_lph=NAN, fuel_level_pct=NAN, ethanol_pct=NAN;
 
   static Frame buf[256];
   int idx = 0;
   int rx_count = 0;
 
-  // FAST set (2–5 Hz targets)
+  // FAST set (2–5 Hz)
   const uint8_t pids_fast[] = {
-    0x0C, // RPM
-    0x0D, // Speed
-    0x05, // Coolant
-    0x10, // MAF
-    0x0B, // MAP
-    0x0F, // IAT
-    0x11, // Throttle
-    0x04, // Calc Load
-    0x42, // Battery
-    0x06,0x07,0x08,0x09 // Trims B1/B2
+    0x0C, 0x0D, 0x05, 0x10, 0x0B, 0x0F, 0x11, 0x04, 0x42, 0x06,0x07,0x08,0x09
   };
   for (uint8_t pid : pids_fast) {
     requestPID_sweep(pid, buf, idx, 256,
-      batt,coolant,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
+      batt,coolant_c,coolant_f,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
       speed_kph,speed_mph,load_pct, maf_gps,map_kpa,iat_c,tps_pct,
       baro_kpa,lambda_cmd, af_lambda_b1s1,
       cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph,
+      fuel_level_pct,ethanol_pct,
       rx_count);
     delay(120);
   }
@@ -555,21 +683,14 @@ void loop() {
   // SLOW set (every N loops)
   static uint32_t loopCounter=0;
   if ((loopCounter % SLOW_LOOP_EVERY) == 0) {
-    const uint8_t pids_slow[] = {
-      0x01, // Monitor status (we don't decode here, useful for MIL/ready in future)
-      0x33, // BARO
-      0x44, // Commanded lambda
-      0x24, // Wideband lambda B1S1 (if supported)
-      0x3C,0x3D,0x3E,0x3F, // Catalyst temps
-      0x52, // Oil temp (if supported)
-      0x5E  // Fuel rate (if supported)
-    };
+    const uint8_t pids_slow[] = { 0x01, 0x33, 0x44, 0x24, 0x3C,0x3D,0x3E,0x3F, 0x5C, 0x5E, 0x2F, 0x52 };
     for (uint8_t pid : pids_slow) {
       requestPID_sweep(pid, buf, idx, 256,
-        batt,coolant,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
+        batt,coolant_c,coolant_f,rpm,runtime_s, stft_b1,ltft_b1,stft_b2,ltft_b2,
         speed_kph,speed_mph,load_pct, maf_gps,map_kpa,iat_c,tps_pct,
         baro_kpa,lambda_cmd, af_lambda_b1s1,
         cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c, oil_temp_c,fuel_rate_lph,
+        fuel_level_pct,ethanol_pct,
         rx_count);
       delay(150);
     }
@@ -580,13 +701,46 @@ void loop() {
   static bool triedVIN = false;
   if (!triedVIN && rx_count > 0 && vehicle_id == "unknown") { triedVIN = true; requestVIN(); }
 
-  Serial.printf("VIN=%s  RX=%d  RPM=%s  Spd=%s kph  ECT=%s°C  Batt=%sV  LTFT1=%s%%  LOAD=%s%%  MAF=%s g/s  MAP=%s kPa  IAT=%s°C  TP=%s%%  λcmd=%s  Oil=%s°C  Fuel=%s L/h\n",
+  // ---- DTCs & misfire flags every SLOW cycle ----
+  bool misfireByDTC=false;
+  uint8_t misfire_cyl[8]={0,0,0,0,0,0,0,0};
+  dtcCSV = "";
+  if ((loopCounter % SLOW_LOOP_EVERY) == 0) {
+    bool tmp=false;
+    requestDTC(0x07, tmp, misfire_cyl); // pending
+    misfireByDTC |= tmp;
+    requestDTC(0x03, tmp, misfire_cyl); // stored
+    misfireByDTC |= tmp;
+    requestDTC(0x0A, tmp, misfire_cyl); // permanent
+    misfireByDTC |= tmp;
+  }
+
+  // ---- Misfire heuristic (index 0..1) ----
+  stat_push(rpm, stft_b1);
+  float rpm_mean, rpm_std; stat_mean_std(rpm_hist, rpm_mean, rpm_std);
+  float stft_mean, stft_std; stat_mean_std(stft_hist, stft_mean, stft_std);
+
+  float misfire_index = NAN; bool misfire_alert = false;
+  if (!isnan(rpm_mean) && rpm_mean>400 && rpm_mean<3000 && !isnan(rpm_std)) {
+    float rpm_var_norm = rpm_std / max(500.0f, rpm_mean);   // normalize roughness
+    float stft_norm    = isnan(stft_std)?0.0f:(stft_std/20.0f);
+    float base = rpm_var_norm*3.0f + stft_norm*1.0f;
+    // idle emphasis
+    if (!isnan(speed_mph) && speed_mph < 3.0f) base *= 1.2f;
+    misfire_index = fminf(fmaxf(base, 0.0f), 1.0f);
+    misfire_alert = (misfire_index > 0.70f) || misfireByDTC;
+  }
+
+  // ---- Serial (mph + °F) ----
+  Serial.printf(
+    "VIN=%s RX=%d RPM=%s Spd=%s mph ECT=%s°F Batt=%sV "
+    "LOAD=%s%% MAF=%s g/s MAP=%s kPa IAT=%s°C TP=%s%% λcmd=%s "
+    "Oil=%s°C FuelLvl=%s%% FuelRate=%s L/h  MisIdx=%s Alert=%s DTCs=[%s]\n",
     vehicle_id.c_str(), rx_count,
     isnan(rpm)?"-":String(rpm,0).c_str(),
-    isnan(speed_kph)?"-":String(speed_kph,0).c_str(),
-    isnan(coolant)?"-":String(coolant,1).c_str(),
+    isnan(speed_mph)?"-":String(speed_mph,0).c_str(),
+    isnan(coolant_f)?"-":String(coolant_f,1).c_str(),
     isnan(batt)?"-":String(batt,2).c_str(),
-    isnan(ltft_b1)?"-":String(ltft_b1,1).c_str(),
     isnan(load_pct)?"-":String(load_pct,0).c_str(),
     isnan(maf_gps)?"-":String(maf_gps,1).c_str(),
     isnan(map_kpa)?"-":String(map_kpa,0).c_str(),
@@ -594,28 +748,38 @@ void loop() {
     isnan(tps_pct)?"-":String(tps_pct,0).c_str(),
     isnan(lambda_cmd)?"-":String(lambda_cmd,3).c_str(),
     isnan(oil_temp_c)?"-":String(oil_temp_c,1).c_str(),
-    isnan(fuel_rate_lph)?"-":String(fuel_rate_lph,2).c_str()
+    isnan(fuel_level_pct)?"-":String(fuel_level_pct,0).c_str(),
+    isnan(fuel_rate_lph)?"-":String(fuel_rate_lph,2).c_str(),
+    isnan(misfire_index)?"-":String(misfire_index,2).c_str(),
+    misfire_alert?"YES":"no",
+    dtcCSV.c_str()
   );
 
+  // Upload if we got replies
   if (rx_count > 0) {
-    bool haveParsed = (!isnan(rpm) || !isnan(coolant) || !isnan(batt) || !isnan(speed_kph) ||
-                       !isnan(load_pct) || !isnan(maf_gps) || !isnan(map_kpa) || !isnan(iat_c) ||
-                       !isnan(tps_pct) || !isnan(baro_kpa) || !isnan(lambda_cmd) ||
-                       !isnan(af_lambda_b1s1) || !isnan(cat_b1s1_c) || !isnan(cat_b1s2_c) ||
-                       !isnan(cat_b2s1_c) || !isnan(cat_b2s2_c) || !isnan(oil_temp_c) ||
-                       !isnan(fuel_rate_lph) || runtime_s >= 0 ||
-                       !isnan(stft_b1) || !isnan(ltft_b1) || !isnan(stft_b2) || !isnan(ltft_b2));
+    bool haveParsed =
+      (!isnan(rpm) || !isnan(coolant_c) || !isnan(batt) || !isnan(speed_mph) ||
+       !isnan(load_pct) || !isnan(maf_gps) || !isnan(map_kpa) || !isnan(iat_c) ||
+       !isnan(tps_pct) || !isnan(baro_kpa) || !isnan(lambda_cmd) ||
+       !isnan(af_lambda_b1s1) || !isnan(cat_b1s1_c) || !isnan(cat_b1s2_c) ||
+       !isnan(cat_b2s1_c) || !isnan(cat_b2s2_c) || !isnan(oil_temp_c) ||
+       !isnan(fuel_rate_lph) || !isnan(fuel_level_pct) || !isnan(ethanol_pct) ||
+       !isnan(misfire_index) || misfire_alert || dtcCSV.length() > 0 ||
+       runtime_s >= 0 || !isnan(stft_b1) || !isnan(ltft_b1) || !isnan(stft_b2) || !isnan(ltft_b2));
 
     if (haveParsed) {
       postSensorData(
-        batt,coolant,rpm,runtime_s,
+        batt,coolant_c,coolant_f,rpm,runtime_s,
         stft_b1,ltft_b1,stft_b2,ltft_b2,
         speed_kph,speed_mph,load_pct,
         maf_gps,map_kpa,iat_c,tps_pct,
         baro_kpa,lambda_cmd,
         af_lambda_b1s1,
         cat_b1s1_c,cat_b1s2_c,cat_b2s1_c,cat_b2s2_c,
-        oil_temp_c,fuel_rate_lph
+        oil_temp_c,fuel_rate_lph,
+        fuel_level_pct,ethanol_pct,
+        misfire_index, misfire_alert,
+        dtcCSV, misfire_cyl
       );
     }
     if (idx > 0)    postRawFramesBatch(buf, idx);
