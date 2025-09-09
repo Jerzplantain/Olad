@@ -1,0 +1,471 @@
+// ==== ESP32 OBD-II (11-bit + 29-bit) → Supabase, strict responder-match + ISO-TP & VIN ====
+// CAN pins: GPIO22 -> CTX, GPIO21 -> CRX  |  Bus: 500 kbps (HS-CAN)
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include "driver/twai.h"
+#include "esp_err.h"
+#include <math.h>
+#include <ctype.h>
+
+// -------- EDIT ME (Wi-Fi & Supabase) --------
+const char* WIFI_SSID = "YOUR_WIFI";
+const char* WIFI_PASS = "YOUR_PASS";
+
+const char* SUPABASE_HOST = "zhrlppnknfjxhwhfsdxd.supabase.co";
+const char* SENSOR_PATH   = "/rest/v1/sensor_data";
+const char* RAW_PATH      = "/rest/v1/can_raw";
+String SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpocmxwcG5rbmZqeGh3aGZzZHhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY3NjIsImV4cCI6MjA3MjE0Mjc2Mn0.EVrzx09YwDglwFUCjS3hKbrg2Wdy1hjSPV1gWxnN_yU";
+
+// If your CAN transceiver has RS/EN/STB (standby) pin: LOW = normal TX/RX.
+// Wire module STB/EN/RS -> ESP32 GPIO5 (or tie to GND).
+#define TRANS_STB_PIN  5
+
+// Optional: short sniff first; we’ll force NORMAL afterwards anyway
+#define LISTEN_FIRST_MS 1000
+
+// CAN pins
+#define TWAI_TX_PIN GPIO_NUM_22
+#define TWAI_RX_PIN GPIO_NUM_21
+
+// Timing
+#define PID_REPLY_WINDOW_MS 450
+#define TESTER_PRESENT_MS   2000
+
+// Posting
+#define RAW_CHUNK_SIZE    64
+#define MAX_RAW_PER_LOOP  128   // tighter cap to avoid RX pressure
+
+Preferences prefs;
+String vehicle_id = "unknown";
+
+struct Frame { uint32_t ts, id; uint8_t dlc, data[8]; bool is_ext; };
+
+WiFiClientSecure secureClient;
+HTTPClient http;
+static bool wifiConnectedOnce=false;
+static uint32_t lastWifiAttemptMs=0;
+
+// ---------- Wi-Fi ----------
+static bool wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  if (millis() - lastWifiAttemptMs < 5000 && WiFi.status() == WL_DISCONNECTED) return false;
+  lastWifiAttemptMs = millis();
+  if (!wifiConnectedOnce) { WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); }
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi");
+  uint32_t t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0<20000) { delay(300); Serial.print("."); }
+  Serial.println();
+  if (WiFi.status()==WL_CONNECTED) {
+    wifiConnectedOnce=true;
+    Serial.printf("WiFi OK, IP: %s  RSSI=%d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    return true;
+  }
+  Serial.println("WiFi FAILED");
+  return false;
+}
+static void ensureWifi(){ if (WiFi.status()!=WL_CONNECTED) wifiConnect(); }
+
+// ---------- TWAI helpers ----------
+static void pushFromMsg(Frame& dst, const twai_message_t& m){
+  dst.ts=millis(); bool ext=(m.flags & TWAI_MSG_FLAG_EXTD);
+  dst.id = ext ? m.identifier : (m.identifier & 0x7FF);
+  dst.is_ext=ext; dst.dlc=m.data_length_code;
+  for (int i=0;i<dst.dlc && i<8;i++) dst.data[i]=m.data[i];
+}
+static const char* stateName(int s){
+  switch(s){ case 0: return "STOPPED"; case 1: return "RUNNING"; case 2: return "BUS_OFF"; case 3: return "RECOVERING"; default: return "?"; }
+}
+static void logCanStatus(const char* tag){
+  twai_status_info_t s{};
+  if (twai_get_status_info(&s)==ESP_OK){
+    Serial.printf("[%s] state=%s  tx_err=%d rx_err=%d  tx_failed=%u rx_missed=%u arb_lost=%u bus_err=%u\n",
+      tag, stateName(s.state), s.tx_error_counter, s.rx_error_counter,
+      (unsigned)s.tx_failed_count, (unsigned)s.rx_missed_count, (unsigned)s.arb_lost_count, (unsigned)s.bus_error_count);
+  }
+}
+static void canAlertPumpAndRecover(){
+  uint32_t alerts=0;
+  if (twai_read_alerts(&alerts, 0)==ESP_OK){
+    if (alerts & TWAI_ALERT_BUS_OFF){
+      Serial.println("⚠ BUS-OFF → recovery");
+      twai_initiate_recovery();
+      while (twai_read_alerts(&alerts, portMAX_DELAY)==ESP_OK){
+        if (alerts & TWAI_ALERT_BUS_RECOVERED) break;
+      }
+      twai_start();
+      logCanStatus("recovered");
+    }
+    if (alerts & TWAI_ALERT_RX_QUEUE_FULL) Serial.println("⚠ RX queue full");
+    if (alerts & TWAI_ALERT_TX_FAILED)     Serial.println("⚠ TX failed alert");
+    if (alerts & TWAI_ALERT_ARB_LOST)      Serial.println("⚠ Arbitration lost");
+  }
+}
+
+static bool canInstallStart(twai_mode_t mode){
+  if (TRANS_STB_PIN >= 0){ pinMode(TRANS_STB_PIN, OUTPUT); digitalWrite(TRANS_STB_PIN, LOW); delay(2); }
+  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX_PIN, TWAI_RX_PIN, mode);
+  g.rx_queue_len = 128;   // bigger buffer for a busy bus
+  g.tx_queue_len = 16;
+  g.alerts_enabled = TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_ERR_PASS | TWAI_ALERT_ARB_LOST |
+                     TWAI_ALERT_TX_FAILED | TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED;
+  twai_timing_config_t  t = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
+  if (twai_start() != ESP_OK) return false;
+  return true;
+}
+static bool canForceNormal(){
+  twai_stop(); twai_driver_uninstall(); delay(50);
+  bool ok = canInstallStart(TWAI_MODE_NORMAL);
+  if (ok) { Serial.println("TWAI NORMAL @ 500 kbps (forced)"); logCanStatus("init"); }
+  return ok;
+}
+
+// If we ever get ESP_ERR_NOT_SUPPORTED on transmit, immediately reinit NORMAL and retry once.
+static bool txMsgWithReinit(twai_message_t& tx){
+  esp_err_t r = twai_transmit(&tx, pdMS_TO_TICKS(60));
+  if (r == ESP_ERR_NOT_SUPPORTED){
+    Serial.println("⚠ NOT_SUPPORTED → likely LISTEN_ONLY. Re-initializing NORMAL…");
+    if (canForceNormal()){
+      r = twai_transmit(&tx, pdMS_TO_TICKS(60));
+    } else {
+      Serial.println("❌ Reinit NORMAL failed");
+    }
+  }
+  if (r!=ESP_OK){
+    Serial.printf("twai_transmit -> %s\n", esp_err_to_name(r));
+    logCanStatus("tx");
+    canAlertPumpAndRecover();
+    return false;
+  }
+  return true;
+}
+
+static inline void drainRxQuick(uint32_t max_us){
+  uint32_t t0=micros(); twai_message_t rx;
+  while (micros()-t0 < max_us) { if (twai_receive(&rx, 0) != ESP_OK) break; }
+}
+
+// ---------- ISO-TP helpers (11-bit + 29-bit) ----------
+static inline bool isDiag11(uint32_t id){ return (id>=0x7E8 && id<=0x7EF); }
+static inline bool isDiag29(uint32_t id){ return ( (id & 0x1FFF0000) == 0x18DA0000 ); } // 0x18DA dest/src pattern
+
+// For EXT responses, expect 0x18DAF1xx (tester = F1 as dest in response)
+static inline bool isExpectedExtResp(uint32_t id){
+  if (!isDiag29(id)) return false;
+  uint8_t dest = (id >> 8) & 0xFF; // byte3
+  return dest == 0xF1;
+}
+
+// Compute the **request** ID for Flow Control based on a **response** frame.
+static uint32_t reqIdFromResp(const twai_message_t& rx){
+  if (rx.flags & TWAI_MSG_FLAG_EXTD){
+    uint32_t id = rx.identifier;
+    if (isDiag29(id)) {
+      uint8_t b0 = (id >> 24) & 0xFF;  // 0x18
+      uint8_t b1 = (id >> 16) & 0xFF;  // 0xDA
+      uint8_t dst= (id >> 8)  & 0xFF;  // F1 (tester)
+      uint8_t src= (id)       & 0xFF;  // ECU (e.g., 0x10)
+      (void)dst;
+      uint32_t req = ((uint32_t)b0<<24) | ((uint32_t)b1<<16) | ((uint32_t)src<<8) | 0xF1;
+      return req;
+    }
+  } else {
+    if (isDiag11(rx.identifier)) return rx.identifier - 8; // e.g., 0x7E8 → 0x7E0
+  }
+  return 0x7E0; // fallback
+}
+static void sendFlowControlToECU_forResp(const twai_message_t& rx){
+  twai_message_t fc={}; fc.identifier = reqIdFromResp(rx);
+  fc.flags = (rx.flags & TWAI_MSG_FLAG_EXTD) ? TWAI_MSG_FLAG_EXTD : TWAI_MSG_FLAG_NONE;
+  fc.data_length_code=8; fc.data[0]=0x30; fc.data[1]=0x00; fc.data[2]=0x00;
+  for (int i=3;i<8;i++) fc.data[i]=0x00;
+  (void)txMsgWithReinit(fc);
+}
+static void sendTesterPresent(uint32_t reqId, bool ext){
+  twai_message_t m={}; m.identifier=reqId; m.flags= ext?TWAI_MSG_FLAG_EXTD:TWAI_MSG_FLAG_NONE; m.data_length_code=8;
+  m.data[0]=0x02; m.data[1]=0x3E; m.data[2]=0x00;
+  (void)txMsgWithReinit(m);
+}
+static void sendTesterPresent_All(){
+  sendTesterPresent(0x7E0,false);        // 11-bit ECM
+  sendTesterPresent(0x18DA10F1,true);    // 29-bit ECM physical (common)
+}
+
+// ---------- Supabase ----------
+static bool httpBeginHostPath(HTTPClient& cli, const char* host, const char* path){
+  return cli.begin(secureClient, host, 443, path, true);
+}
+static bool supabasePostJson(const char* path, const String& payload){
+  ensureWifi();
+  if (!httpBeginHostPath(http, SUPABASE_HOST, path)){ Serial.println("HTTP begin failed"); return false; }
+  http.setTimeout(15000); secureClient.setTimeout(15000);
+  http.addHeader("Content-Type","application/json");
+  http.addHeader("apikey", SUPABASE_KEY); http.addHeader("Authorization","Bearer "+SUPABASE_KEY);
+  http.addHeader("Prefer","return=minimal");
+  int code = http.POST((uint8_t*)payload.c_str(), payload.length());
+  String resp = http.getString();
+  Serial.printf("POST %d to https://%s%s\n", code, SUPABASE_HOST, path);
+  if (code<200 || code>=300){ Serial.println(resp); http.end(); return false; }
+  http.end(); return true;
+}
+
+// ---------- Posting helpers ----------
+static String toHexBytes(const uint8_t* data, uint8_t len){
+  char buf[3]; String s; for(uint8_t i=0;i<len;i++){ if(i) s+=' '; snprintf(buf,sizeof(buf),"%02X",data[i]); s+=buf; } return s;
+}
+static bool postRawFramesBatchLimited(const Frame* frames, int count){
+  int limit = min(count, MAX_RAW_PER_LOOP);
+  int sent=0;
+  while(sent<limit){
+    int n=min(RAW_CHUNK_SIZE, limit-sent);
+    StaticJsonDocument<4096> doc; JsonArray arr=doc.to<JsonArray>();
+    for(int i=0;i<n;i++){
+      const Frame& fr=frames[sent+i]; JsonObject r=arr.createNestedObject();
+      r["vehicle_id"]=vehicle_id; r["vin"]=vehicle_id;
+      r["can_id"]=(int)fr.id; r["is_ext"]=fr.is_ext; r["dlc"]=(int)fr.dlc;
+      r["data_hex"]=toHexBytes(fr.data, fr.dlc); r["ts_ms"]=(long long)fr.ts;
+    }
+    String payload; serializeJson(doc, payload);
+    if (!supabasePostJson(RAW_PATH, payload)) return false;
+    sent+=n;
+  }
+  return true;
+}
+static bool postSensorData(float batt,float coolant,float rpm,float stft_b1,float ltft_b1,float stft_b2,float ltft_b2,long runtime_s){
+  StaticJsonDocument<640> doc;
+  doc["vehicle_id"]=vehicle_id; doc["vin"]=vehicle_id;
+  if(!isnan(batt)) doc["batt"]=batt; if(!isnan(coolant)) doc["coolant"]=coolant; if(!isnan(rpm)) doc["rpm"]=rpm;
+  if(!isnan(stft_b1)) doc["stft_b1"]=stft_b1; if(!isnan(ltft_b1)) doc["ltft_b1"]=ltft_b1;
+  if(!isnan(stft_b2)) doc["stft_b2"]=stft_b2; if(!isnan(ltft_b2)) doc["ltft_b2"]=ltft_b2;
+  if(runtime_s>=0) doc["runtime_s"]=runtime_s;
+  String payload; serializeJson(doc, payload);
+  return supabasePostJson(SENSOR_PATH, payload);
+}
+
+// ---------- Decoders ----------
+static float decodeTemp(uint8_t A){ return (float)A - 40.0f; }
+static float decodeRPM(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/4.0f; }
+static float decodeVoltage(uint8_t A,uint8_t B){ return ((A*256.0f)+B)/1000.0f; }
+static float decodeTrim(uint8_t A){ return ((float)A - 128.0f) * 100.0f / 128.0f; }
+static long  decodeU16(uint8_t A,uint8_t B){ return (long)(A*256 + B); }
+
+// ---------- VIN (tries 11b + 29b) ----------
+static bool isLikelyDiagFrame(const twai_message_t& rx){
+  return (isDiag11(rx.identifier) || ((rx.flags & TWAI_MSG_FLAG_EXTD) && isDiag29(rx.identifier)));
+}
+static String parseVINFromReplies(uint32_t timeout_ms){
+  char vinbuf[32]; uint8_t vinlen=0; char partBuf[3][8]; uint8_t partLen[3]={0,0,0}; bool gotPart[3]={false,false,false}; bool sawFF=false;
+  uint32_t t0=millis();
+  while(millis()-t0<timeout_ms){
+    twai_message_t rx; if (twai_receive(&rx, pdMS_TO_TICKS(20))!=ESP_OK) continue;
+    const uint8_t* d=rx.data; uint8_t dlc=rx.data_length_code; if(dlc<3) continue;
+
+    bool fromExpected = ((rx.flags & TWAI_MSG_FLAG_EXTD) ? isExpectedExtResp(rx.identifier) : isDiag11(rx.identifier));
+    if (!fromExpected) continue;
+
+    Serial.printf("🔎 VIN diag %s 0x%08X: %02X %02X %02X %02X ...\n",
+      (rx.flags & TWAI_MSG_FLAG_EXTD)?"EXT":"STD", rx.identifier, d[0], d[1], d[2], d[3]);
+
+    if ((d[0]&0xF0)==0x10 && dlc>=6 && d[2]==0x49 && d[3]==0x02){
+      sawFF=true; sendFlowControlToECU_forResp(rx);
+      for(uint8_t i=5;i<dlc && vinlen<31;i++){ char c=(char)d[i]; if(c>=' '&&c<='~') vinbuf[vinlen++]=c; } continue;
+    }
+    if ((d[0]&0xF0)==0x20 && dlc>=2 && sawFF){
+      for(uint8_t i=1;i<dlc && vinlen<31;i++){ char c=(char)d[i]; if(c>=' '&&c<='~') vinbuf[vinlen++]=c; } continue;
+    }
+    if (dlc>=4 && d[1]==0x49 && d[2]==0x02){
+      uint8_t part=d[3]; if(part>=1 && part<=3){ uint8_t idx=part-1, start=4, len= dlc>start? (dlc-start):0; if(len>7) len=7;
+        for(uint8_t i=0;i<len;i++) partBuf[idx][i]=(char)d[start+i]; partLen[idx]=len; gotPart[idx]=true; }
+    }
+  }
+  String vin;
+  if (vinlen){ for(uint8_t i=0;i<vinlen;i++) if(vinbuf[i]!=' ') vin+=vinbuf[i]; }
+  else { for(uint8_t p=0;p<3;p++) if(gotPart[p]) for(uint8_t i=0;i<partLen[p];i++) if(partBuf[p][i]!=' ') vin+=partBuf[p][i]; }
+  if (vin.length()>17) vin=vin.substring(0,17);
+  if (vin.length()>=11) return vin;
+  return String();
+}
+static bool requestVIN_once(uint32_t reqId, bool ext){
+  twai_message_t tx={}; tx.identifier=reqId; tx.flags= ext?TWAI_MSG_FLAG_EXTD:TWAI_MSG_FLAG_NONE; tx.data_length_code=8;
+  tx.data[0]=0x02; tx.data[1]=0x09; tx.data[2]=0x02; for(int i=3;i<8;i++) tx.data[i]=0x00;
+  drainRxQuick(12000);
+  if (!txMsgWithReinit(tx)) { Serial.printf("TX VIN failed @%s 0x%08X\n", ext?"EXT":"STD", reqId); return false; }
+  Serial.printf("📤 VIN request @%s 0x%08X\n", ext?"EXT":"STD", reqId);
+  String vin = parseVINFromReplies(1500);
+  if (vin.length()>=11){ vehicle_id=vin; Serial.printf("✅ VIN: %s\n", vehicle_id.c_str()); return true; }
+  return false;
+}
+static void requestVIN(){
+  if (requestVIN_once(0x7E0,false)) goto save;
+  if (requestVIN_once(0x7DF,false)) goto save;
+  if (requestVIN_once(0x18DA10F1,true)) goto save;
+  if (requestVIN_once(0x18DB33F1,true)) goto save;
+  Serial.println("⚠ VIN not found");
+  return;
+save:
+  prefs.begin("veh", false); prefs.putString("vin", vehicle_id); prefs.end();
+}
+
+// ---------- OBD PIDs (strict success = positive only) ----------
+static void parsePositivePID(uint8_t pid, const twai_message_t& rx,
+  float& batt,float& coolant,float& rpm,float& stft_b1,float& ltft_b1,float& stft_b2,float& ltft_b2,long& runtime_s)
+{
+  const uint8_t* d=rx.data; if (rx.data_length_code<5) return;
+  if (d[1]==0x41 && d[2]==pid){
+    uint8_t A=d[3], B=d[4];
+    switch(pid){
+      case 0x05: coolant=(float)A-40.0f; break;
+      case 0x0C: rpm=((A*256.0f)+B)/4.0f; break;
+      case 0x42: batt=((A*256.0f)+B)/1000.0f; break;
+      case 0x1F: runtime_s=(long)(A*256+B); break;
+      case 0x06: stft_b1=((float)A-128.0f)*100.0f/128.0f; break;
+      case 0x07: ltft_b1=((float)A-128.0f)*100.0f/128.0f; break;
+      case 0x08: stft_b2=((float)A-128.0f)*100.0f/128.0f; break;
+      case 0x09: ltft_b2=((float)A-128.0f)*100.0f/128.0f; break;
+    }
+  }
+}
+static bool isPositiveForPid(const twai_message_t& rx, uint8_t pid){
+  const uint8_t* d=rx.data; uint8_t dlc=rx.data_length_code;
+  return (dlc>=5 && d[1]==0x41 && d[2]==pid);
+}
+static bool isNegativeForService01(const twai_message_t& rx){
+  const uint8_t* d=rx.data; uint8_t dlc=rx.data_length_code;
+  return (dlc>=4 && d[1]==0x7F && d[2]==0x01);
+}
+
+static bool requestPID_once(uint8_t pid, uint32_t reqId, bool ext,
+  Frame* out,int& idx,int max,
+  float& batt,float& coolant,float& rpm,float& stft_b1,float& ltft_b1,float& stft_b2,float& ltft_b2,long& runtime_s,int& rx_count)
+{
+  if (idx>=max) return false;
+
+  drainRxQuick(12000);
+
+  twai_message_t tx={}; tx.identifier=reqId; tx.flags= ext?TWAI_MSG_FLAG_EXTD:TWAI_MSG_FLAG_NONE; tx.data_length_code=8;
+  tx.data[0]=0x02; tx.data[1]=0x01; tx.data[2]=pid; for(int i=3;i<8;i++) tx.data[i]=0x00;
+
+  if (!txMsgWithReinit(tx)){ Serial.printf("TX failed PID 0x%02X @%s 0x%08X\n", pid, ext?"EXT":"STD", reqId); return false; }
+  Serial.printf("📤 PID 0x%02X @%s 0x%08X\n", pid, ext?"EXT":"STD", reqId);
+
+  uint32_t t0=millis(); bool gotPositive=false;
+  while(millis()-t0<PID_REPLY_WINDOW_MS && idx<max){
+    twai_message_t rx;
+    if (twai_receive(&rx, pdMS_TO_TICKS(10))==ESP_OK){
+      // Only consider frames from the expected responder range for this attempt
+      bool fromExpected = ext ? ((rx.flags & TWAI_MSG_FLAG_EXTD) && isExpectedExtResp(rx.identifier))
+                              : (!(rx.flags & TWAI_MSG_FLAG_EXTD) && isDiag11(rx.identifier));
+      if (!fromExpected) continue;
+
+      // Debug print
+      Serial.printf("🔎 diag %s 0x%08X: ", (rx.flags & TWAI_MSG_FLAG_EXTD)?"EXT":"STD", rx.identifier);
+      char b[3]; for(int i=0;i<rx.data_length_code;i++){ if(i) Serial.print(' '); snprintf(b,sizeof(b),"%02X",rx.data[i]); Serial.print(b); }
+      Serial.println();
+
+      // ISO-TP flow control for multi-frame
+      if ((rx.data[0]&0xF0)==0x10 && rx.data_length_code>=3) sendFlowControlToECU_forResp(rx);
+
+      // Keep only diag frames to reduce posting volume
+      Frame f; pushFromMsg(f, rx); out[idx++]=f; rx_count++;
+
+      if (isPositiveForPid(rx, pid)){
+        gotPositive=true;
+        parsePositivePID(pid, rx, batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s);
+      } else if (isNegativeForService01(rx)) {
+        // Negative response: DO NOT mark success; allow fallback to try other addressing
+        uint8_t code = rx.data[3];
+        Serial.printf("❌ Negative for PID 0x%02X (NR code 0x%02X) — will try next addressing\n", pid, code);
+      }
+    }
+  }
+  return gotPositive; // success only on positive reply
+}
+static void requestPID_all(uint8_t pid,
+  Frame* out,int& idx,int max,
+  float& batt,float& coolant,float& rpm,float& stft_b1,float& ltft_b1,float& stft_b2,float& ltft_b2,long& runtime_s,int& rx_count)
+{
+  if (requestPID_once(pid, 0x7E0,      false, out,idx,max, batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s, rx_count)) return;
+  if (requestPID_once(pid, 0x7DF,      false, out,idx,max, batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s, rx_count)) return;
+  if (requestPID_once(pid, 0x18DA10F1, true,  out,idx,max, batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s, rx_count)) return;
+  (void)requestPID_once(pid, 0x18DB33F1, true, out,idx,max, batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s, rx_count);
+}
+
+// ---------- Arduino ----------
+void setup(){
+  Serial.begin(115200); delay(200);
+  Serial.println("\nESP32 OBD-II → Supabase (11b+29b, responder-match, ISO-TP)");
+
+  // Stored VIN
+  prefs.begin("veh", true); String nvsVIN=prefs.getString("vin",""); prefs.end();
+  if (nvsVIN.length()>=11){ vehicle_id=nvsVIN; Serial.printf("ℹ stored VIN: %s\n", vehicle_id.c_str()); }
+
+  wifiConnect();
+  secureClient.setInsecure();   // (For production, consider pinning LE R3)
+
+  // 1) LISTEN_ONLY (brief)
+  if (!canInstallStart(TWAI_MODE_LISTEN_ONLY)) {
+    Serial.println("CAN LISTEN_ONLY init FAILED (check wiring and power)"); while(1) delay(1000);
+  }
+  Serial.println("TWAI LISTEN_ONLY @ 500 kbps (sniffing briefly)");
+  logCanStatus("listen");
+
+  // Sniff
+  uint32_t t0 = millis(); int sniff_rx = 0;
+  while (millis()-t0 < LISTEN_FIRST_MS) {
+    twai_message_t rx;
+    if (twai_receive(&rx, pdMS_TO_TICKS(5)) == ESP_OK) sniff_rx++;
+  }
+  Serial.printf("Sniff window done: frames=%d\n", sniff_rx);
+
+  // 2) FORCE NORMAL regardless (prevents NOT_SUPPORTED)
+  if (!canForceNormal()) { Serial.println("CAN NORMAL init FAILED"); while(1) delay(1000); }
+}
+
+void loop(){
+  ensureWifi();
+
+  static uint32_t lastTP=0;
+  if (millis()-lastTP > TESTER_PRESENT_MS){ sendTesterPresent_All(); lastTP=millis(); }
+
+  // Metrics
+  float batt=NAN, coolant=NAN, rpm=NAN, stft_b1=NAN, ltft_b1=NAN, stft_b2=NAN, ltft_b2=NAN;
+  long runtime_s=-1;
+
+  static Frame buf[256]; int idx=0; int rx_count=0;
+
+  const uint8_t pids[] = {0x0C, 0x05, 0x42, 0x1F};
+  for (uint8_t pid: pids) {
+    requestPID_all(pid, buf, idx, 256, batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s, rx_count);
+    delay(20);
+  }
+
+  // VIN once ECUs awake & not yet set this boot
+  static bool triedVIN=false;
+  if (!triedVIN && rx_count>0 && vehicle_id=="unknown"){ triedVIN=true; requestVIN(); }
+
+  Serial.printf("VIN=%s  RX=%d  RPM=%s  Coolant=%s°C  Batt=%sV  Runtime=%lds\n",
+    vehicle_id.c_str(), rx_count,
+    isnan(rpm)?"nan":String(rpm,0).c_str(),
+    isnan(coolant)?"nan":String(coolant,1).c_str(),
+    isnan(batt)?"nan":String(batt,2).c_str(),
+    runtime_s);
+
+  if (rx_count>0){
+    bool haveParsed = (!isnan(rpm)||!isnan(coolant)||!isnan(batt)||runtime_s>=0||
+                       !isnan(stft_b1)||!isnan(ltft_b1)||!isnan(stft_b2)||!isnan(ltft_b2));
+    if (haveParsed) postSensorData(batt,coolant,rpm,stft_b1,ltft_b1,stft_b2,ltft_b2, runtime_s);
+    if (idx>0) postRawFramesBatchLimited(buf, idx);
+  } else {
+    Serial.println("No replies this cycle.");
+  }
+
+  canAlertPumpAndRecover();
+  delay(800);
+}
