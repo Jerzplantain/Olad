@@ -1,0 +1,6 @@
+Vehicle tested on. & Pids Currently working
+
+
+
+2015 Honda accord -------------------- VIN # ✔️ Battery voltage ✔️ Coolant temp ✔️ Rpms ✔️) stft ✔️ ltft ✔️ Runtime ⚠️ ( showing in serial monitor, not reporting to Supabase) Speed ✔️ load_pct ✔️ maf_gps ✔️ iat_c ✔️
+map_kpa ✔️ tps_pct ✔️ baro_kpa ✔️ lambda_cmd ✔️ cat_b1s1_c ✔️ fuel_level_pct ⚠️( numbers are kind of fishy* ) 
