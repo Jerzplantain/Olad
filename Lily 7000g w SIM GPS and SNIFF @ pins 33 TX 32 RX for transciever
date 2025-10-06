@@ -1,0 +1,304 @@
+/*
+  LilyGO T-SIM7000G + TinyGSM + GNSS + CAN (TWAI)
+  Provider: Hologram (LTE-M) — NO PDP attach to avoid data use
+*/
+
+#define TINY_GSM_MODEM_SIM7000
+#define TINY_GSM_RX_BUFFER 1024
+
+#define SerialAT  Serial1
+#define SerialMon Serial
+
+// -------- Hologram (not using data here) --------
+const char apn[] = "hologram";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+#define GSM_PIN ""   // SIM PIN if any
+
+// ---- Includes ----
+#include <TinyGsmClient.h>
+#include <SPI.h>
+#include <SD.h>
+
+// ESP32 built-in CAN controller (TWAI)
+#include "driver/twai.h"
+
+// ---- Pins: LilyGO T-SIM7000G ----
+#define UART_BAUD   115200
+#define PIN_DTR     25     // Keep LOW to prevent sleep
+#define PIN_TX      27     // SIM7000 UART TX (ESP RX)
+#define PIN_RX      26     // SIM7000 UART RX (ESP TX)
+#define PIN_PWRKEY  4
+#define LED_PIN     12
+
+#define SD_MISO     2
+#define SD_MOSI     15
+#define SD_SCLK     14
+#define SD_CS       13
+
+// ---- ESP32 TWAI (CAN) pins ----
+#define CAN_TX_PIN  33
+#define CAN_RX_PIN  32
+// Common OBD-II CAN speeds: 500k for HS-CAN, 125k some subsystems
+// You can switch to TWAI_TIMING_CONFIG_250KBITS etc. if needed.
+#define CAN_TIMING  TWAI_TIMING_CONFIG_500KBITS()
+
+// AT bridge toggle (non-blocking either way)
+#define AT_BRIDGE_ENABLED 1
+
+TinyGsm modem(SerialAT);
+
+// -------- Helpers --------
+static inline void modemPowerKeyPulse() {
+  pinMode(PIN_PWRKEY, OUTPUT);
+  digitalWrite(PIN_PWRKEY, LOW);
+  delay(1000);
+  digitalWrite(PIN_PWRKEY, HIGH);
+}
+
+static inline void modemStart() {
+  modemPowerKeyPulse();
+}
+
+static inline void modemRestartHard() {
+  modemPowerKeyPulse();
+  delay(1200);
+  modemPowerKeyPulse();
+}
+
+// --- GNSS helpers ---
+bool enableGNSS() {
+  SerialMon.println("Enabling GNSS...");
+  if (!modem.enableGPS()) {
+    SerialMon.println("Failed to enable GNSS (enableGPS() returned false).");
+    return false;
+  }
+  return true;
+}
+
+bool readGNSSOnce(float &lat, float &lon, float &alt, float &acc, int &vsat, int &usat, float &speed) {
+  return modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &acc);
+}
+
+void printGNSS(float lat, float lon, float alt, float acc, int vsat, int usat, float speed) {
+  SerialMon.printf("GNSS: lat=%.6f lon=%.6f alt=%.1f m acc=%.1f m sats(view/used)=%d/%d speed=%.1f m/s\n",
+                   lat, lon, alt, acc, vsat, usat, speed);
+  SerialMon.printf("Maps: https://maps.google.com/?q=%.6f,%.6f\n", lat, lon);
+}
+
+// --- CAN helpers ---
+static inline const char* canFrameTypeStr(const twai_message_t &msg) {
+  return msg.extd ? "EXT" : "STD";
+}
+
+static inline void printCanFrame(const twai_message_t &msg, uint32_t us) {
+  // ID
+  uint32_t id = msg.identifier;
+  // DLC and data
+  SerialMon.printf("CAN %s 0x%08lX  DLC=%d  DATA=",
+                   canFrameTypeStr(msg), (unsigned long)id, msg.data_length_code);
+  for (int i = 0; i < msg.data_length_code; i++) {
+    SerialMon.printf("%02X", msg.data[i]);
+    if (i < msg.data_length_code - 1) SerialMon.print(' ');
+  }
+  // Flags
+  if (msg.rtr) SerialMon.print(" RTR");
+  SerialMon.printf("  t=%lu us\n", (unsigned long)us);
+}
+
+bool initCAN() {
+  // General config: normal mode, set TX/RX pins
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
+  // Timing config: 500 kbps by default
+  twai_timing_config_t t_config = CAN_TIMING;
+  // Accept all frames (no filter)
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+    SerialMon.println("TWAI driver install FAILED");
+    return false;
+  }
+  if (twai_start() != ESP_OK) {
+    SerialMon.println("TWAI start FAILED");
+    twai_driver_uninstall();
+    return false;
+  }
+  SerialMon.println("TWAI (CAN) started @ 500 kbps");
+  return true;
+}
+
+// -------- Setup --------
+void setup() {
+  SerialMon.begin(115200);
+  delay(10);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  // Keep modem awake
+  pinMode(PIN_DTR, OUTPUT);
+  digitalWrite(PIN_DTR, LOW);
+
+  // SD (optional)
+  SerialMon.println("======== SDCard Detect ========");
+  SPI.begin(SD_SCLK, SD_MISO, SD_MOSI);
+  if (!SD.begin(SD_CS)) {
+    SerialMon.println("SDCard MOUNT FAIL");
+  } else {
+    uint32_t cardSize = SD.cardSize() / (1024UL * 1024UL);
+    SerialMon.print("SDCard Size: ");
+    SerialMon.print(cardSize);
+    SerialMon.println(" MB");
+  }
+  SerialMon.println("================================");
+
+  // Modem UART
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+  // Wake/Start modem
+  modemStart();
+
+  // Init CAN (TWAI)
+  initCAN();
+
+  SerialMon.println("\n--- T-SIM7000G + Hologram init (no PDP attach) ---");
+}
+
+// State flags
+bool gnssTried = false;
+bool gnssGotFix = false;
+unsigned long gnssPollLast = 0;
+
+// -------- Loop --------
+void loop() {
+  String res;
+
+  // 1) MODEM INIT & LTE registration (no data attach)
+  static bool modemInited = false;
+  if (!modemInited) {
+    SerialMon.println("\n======== INIT MODEM ========");
+    if (!modem.init()) {
+      SerialMon.println("modem.init() failed, trying hard restart...");
+      modemRestartHard();
+      delay(2000);
+      if (!modem.init()) {
+        SerialMon.println("Modem failed to init again. Check power/antenna/SIM.");
+        delay(5000);
+        return;
+      }
+    }
+
+    // Identify modem
+    SerialMon.println("Query modem:");
+    modem.sendAT("+SIMCOMATI");
+    if (modem.waitResponse(2000L, res) == 1) {
+      res.replace("\r\nOK\r\n", "");
+      SerialMon.println(res);
+    }
+    res = "";
+
+    // RAT/bands for Hologram (US)
+    modem.sendAT("+CNMP=38"); modem.waitResponse(2000L); // LTE only
+    modem.sendAT("+CMNB=1");  modem.waitResponse(2000L); // CAT-M only
+    modem.sendAT("+CBANDCFG=\"CAT-M\",\"B2,B4,B12\""); modem.waitResponse(2000L);
+
+    // Confirm settings
+    modem.sendAT("+CNMP?"); modem.waitResponse(2000L, res); SerialMon.println(res); res="";
+    modem.sendAT("+CMNB?"); modem.waitResponse(2000L, res); SerialMon.println(res); res="";
+    modem.sendAT("+CBANDCFG?"); modem.waitResponse(2000L, res); SerialMon.println(res); res="";
+
+    // SIM unlock if needed
+    if (GSM_PIN[0] && modem.getSimStatus() != 3) modem.simUnlock(GSM_PIN);
+
+    // Wait for network registration (NO PDP attach)
+    SerialMon.println("Waiting for LTE-M network (no data session)...");
+    bool netOK = false;
+    for (int i = 0; i < 60; i++) {
+      int16_t sig = modem.getSignalQuality();
+      bool reg   = modem.isNetworkConnected();
+      SerialMon.print("Signal: "); SerialMon.print(sig);
+      SerialMon.print("  Reg: "); SerialMon.println(reg ? "YES" : "NO");
+      if (reg) { netOK = true; break; }
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(1000);
+    }
+    digitalWrite(LED_PIN, HIGH);
+
+    if (!netOK) {
+      SerialMon.println("No network yet. Will retry next loop.");
+      delay(2000);
+      return;
+    }
+
+    // System Info (optional)
+    SerialMon.println("===== CPSI (System Info) =====");
+    modem.sendAT("+CPSI?");
+    if (modem.waitResponse(3000L, res) == 1) {
+      res.replace("\r\nOK\r\n", "");
+      SerialMon.println(res);
+    }
+
+    modemInited = true;
+    SerialMon.println("Modem ready (registered). Skipping PDP to avoid data.");
+  }
+
+  // 2) GNSS: turn on once and poll until a real fix is obtained (stay enabled)
+  if (!gnssTried) {
+    SerialMon.println("Turning GNSS on and starting cold start sequence...");
+    bool gpsOK = enableGNSS();
+    if (!gpsOK) SerialMon.println("TinyGSM enableGPS() reported false (continuing with AT commands).");
+
+    modem.sendAT("+CGNSPWR=1"); modem.waitResponse(2000L);
+    modem.sendAT("+CGNSMOD=1"); modem.waitResponse(2000L);     // standalone (optional)
+    modem.sendAT("+CGNSSEQ=\"RMC\""); modem.waitResponse(2000L);
+    modem.sendAT("+CGNSCOLD"); modem.waitResponse(2000L);      // cold start once
+    gnssTried = true;
+    gnssPollLast = 0; // force immediate poll
+  }
+
+  // Poll GNSS once per second (non-blocking)
+  if (gnssTried && !gnssGotFix) {
+    unsigned long now = millis();
+    if (now - gnssPollLast >= 1000) {
+      gnssPollLast = now;
+
+      String inf;
+      modem.sendAT("+CGNSINF");
+      if (modem.waitResponse(3000L, inf) == 1) {
+        inf.trim(); inf.replace("\r\nOK\r\n", "");
+        SerialMon.println(inf); // raw status
+        float lat=0, lon=0, alt=0, acc=0, speed=0;
+        int vsat=0, usat=0;
+        if (readGNSSOnce(lat, lon, alt, acc, vsat, usat, speed)) {
+          if (lat != 0.0f || lon != 0.0f) {
+            printGNSS(lat, lon, alt, acc, vsat, usat, speed);
+            gnssGotFix = true;
+          }
+        }
+      } else {
+        SerialMon.println("No response to +CGNSINF this cycle.");
+      }
+    }
+  }
+
+  // 3) CAN: read and print any available frames (non-blocking)
+  twai_message_t rx_msg;
+  while (twai_receive(&rx_msg, 0) == ESP_OK) {   // 0 timeout = non-blocking
+    // Timestamp (approximate using micros)
+    uint32_t ts = micros();
+    printCanFrame(rx_msg, ts);
+  }
+
+  // 4) Optional: AT bridge (non-blocking)
+  if (AT_BRIDGE_ENABLED) {
+    while (SerialAT.available()) {
+      SerialMon.write(SerialAT.read());
+    }
+    while (SerialMon.available()) {
+      SerialAT.write(SerialMon.read());
+    }
+  }
+
+  // Small yield
+  delay(5);
+}
