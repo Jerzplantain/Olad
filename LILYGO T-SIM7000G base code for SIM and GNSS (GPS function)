@@ -1,0 +1,299 @@
+/*
+  LilyGO T-SIM7000G + TinyGSM
+  Provider: Hologram (LTE-M)
+*/
+
+#define TINY_GSM_MODEM_SIM7000
+#define TINY_GSM_RX_BUFFER 1024
+
+#define SerialAT  Serial1
+#define SerialMon Serial
+
+// -------- Hologram credentials --------
+const char apn[] = "hologram";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+#define GSM_PIN ""   // SIM PIN if you set one; otherwise leave ""
+
+// ---- Includes ----
+#include <TinyGsmClient.h>
+#include <SPI.h>
+#include <SD.h>
+
+// ---- Pins: LilyGO T-SIM7000G ----
+#define UART_BAUD   115200
+#define PIN_DTR     25     // Keep LOW to prevent sleep
+#define PIN_TX      27
+#define PIN_RX      26
+#define PIN_PWRKEY  4      // Power key to toggle modem
+#define LED_PIN     12
+
+#define SD_MISO     2
+#define SD_MOSI     15
+#define SD_SCLK     14
+#define SD_CS       13
+
+TinyGsm modem(SerialAT);
+
+// -------- Helpers --------
+
+// --- GNSS helpers ---
+bool enableGNSS() {
+  SerialMon.println("Enabling GNSS...");
+  if (!modem.enableGPS()) {
+    SerialMon.println("Failed to enable GNSS (enableGPS() returned false).");
+    return false;
+  }
+  return true;
+}
+
+bool readGNSSOnce(float &lat, float &lon, float &alt, float &acc, int &vsat, int &usat, float &speed) {
+  // TinyGSM returns true if it could read GNSS data (may still be 0,0 before a fix)
+  if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &acc)) {
+    return true;
+  }
+  return false;
+}
+
+void printGNSS(float lat, float lon, float alt, float acc, int vsat, int usat, float speed) {
+  SerialMon.printf("GNSS: lat=%.6f lon=%.6f alt=%.1f m acc=%.1f m sats(view/used)=%d/%d speed=%.1f m/s\n",
+                   lat, lon, alt, acc, vsat, usat, speed);
+  SerialMon.printf("Maps: https://maps.google.com/?q=%.6f,%.6f\n", lat, lon);
+}
+
+static inline void modemPowerKeyPulse() {
+  pinMode(PIN_PWRKEY, OUTPUT);
+  digitalWrite(PIN_PWRKEY, LOW);
+  delay(1000);
+  digitalWrite(PIN_PWRKEY, HIGH);
+}
+
+static inline void modemStart() {
+  // Many T-SIM7000G boards power the module on at boot.
+  // A PWRKEY pulse ensures it's up.
+  modemPowerKeyPulse();
+}
+
+static inline void modemRestartHard() {
+  // Simple sequence that often revives the module
+  modemPowerKeyPulse();
+  delay(1200);
+  modemPowerKeyPulse();
+}
+
+// -------- Setup --------
+void setup() {
+  SerialMon.begin(115200);
+  delay(10);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  // Keep modem awake
+  pinMode(PIN_DTR, OUTPUT);
+  digitalWrite(PIN_DTR, LOW);
+
+  // SD (optional)
+  SerialMon.println("======== SDCard Detect ========");
+  SPI.begin(SD_SCLK, SD_MISO, SD_MOSI);
+  if (!SD.begin(SD_CS)) {
+    SerialMon.println("SDCard MOUNT FAIL");
+  } else {
+    uint32_t cardSize = SD.cardSize() / (1024UL * 1024UL);
+    SerialMon.print("SDCard Size: ");
+    SerialMon.print(cardSize);
+    SerialMon.println(" MB");
+  }
+  SerialMon.println("================================");
+
+  // Modem UART
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+  // Wake/Start modem
+  modemStart();
+
+  SerialMon.println("\n--- T-SIM7000G + Hologram init ---");
+}
+
+// -------- Loop --------
+void loop() {
+  String res;
+
+  SerialMon.println("\n======== INIT MODEM ========");
+  if (!modem.init()) {
+    SerialMon.println("modem.init() failed, trying hard restart...");
+    modemRestartHard();
+    delay(2000);
+    if (!modem.init()) {
+      SerialMon.println("Modem failed to init again. Check power/antenna/SIM.");
+      delay(5000);
+      return;
+    }
+  }
+
+  // Optional: identify modem
+  SerialMon.println("Query modem:");
+  modem.sendAT("+SIMCOMATI");
+  if (modem.waitResponse(2000L, res) == 1) {
+    res.replace("\r\nOK\r\n", "");
+    SerialMon.println(res);
+  }
+  res = "";
+
+  // ---- Force RAT and bands for Hologram (US) ----
+  // CNMP=38 -> LTE only
+  // CMNB=1  -> CAT-M only (not NB-IoT)
+  modem.sendAT("+CNMP=38");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CMNB=1");
+  modem.waitResponse(2000L);
+
+  // Set CAT-M bands. Common US LTE-M: 2,4,12
+  // (If you're outside US, adjust these.)
+  modem.sendAT("+CBANDCFG=\"CAT-M\",\"B2,B4,B12\"");
+  modem.waitResponse(2000L);
+
+  // Confirm RAT/bands
+  modem.sendAT("+CNMP?");
+  modem.waitResponse(2000L, res); SerialMon.println(res); res="";
+  modem.sendAT("+CMNB?");
+  modem.waitResponse(2000L, res); SerialMon.println(res); res="";
+  modem.sendAT("+CBANDCFG?");
+  modem.waitResponse(2000L, res); SerialMon.println(res); res="";
+
+  // SIM unlock if needed
+  if (GSM_PIN[0] && modem.getSimStatus() != 3) {
+    modem.simUnlock(GSM_PIN);
+  }
+
+  // Wait for network registration
+  SerialMon.println("Waiting for LTE-M network...");
+  bool netOK = false;
+  for (int i = 0; i < 60; i++) {
+    int16_t sig = modem.getSignalQuality();
+    bool reg   = modem.isNetworkConnected();
+    SerialMon.print("Signal: "); SerialMon.print(sig);
+    SerialMon.print("  Reg: "); SerialMon.println(reg ? "YES" : "NO");
+    if (reg) { netOK = true; break; }
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    delay(1000);
+  }
+  digitalWrite(LED_PIN, HIGH);
+
+  if (!netOK) {
+    SerialMon.println("No network. Rechecking next cycle.");
+    delay(5000);
+    return;
+  }
+
+  // Set PDP context explicitly (TinyGSM also does this)
+  modem.sendAT("+CGDCONT=1,\"IP\",\"hologram\"");
+  modem.waitResponse(2000L);
+
+  // Attach / bring up data
+  SerialMon.println("Attaching to Hologram APN...");
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    SerialMon.println("gprsConnect failed.");
+    delay(5000);
+    return;
+  }
+
+  if (!modem.isGprsConnected()) {
+    SerialMon.println("Data not connected.");
+    delay(5000);
+    return;
+  }
+
+  IPAddress ip = modem.localIP();
+  SerialMon.print("Connected. IP: ");
+  SerialMon.println(ip);
+
+  // Show system info
+  SerialMon.println("===== CPSI (System Info) =====");
+  modem.sendAT("+CPSI?");
+  if (modem.waitResponse(3000L, res) == 1) {
+    res.replace("\r\nOK\r\n", "");
+    SerialMon.println(res);
+  }
+
+  // ---------- GNSS section: enable and wait for a fix (verbose) ----------
+  {
+    SerialMon.println("Turning GNSS on and starting cold start sequence...");
+
+    // 1) Try TinyGSM helper
+    bool gpsOK = enableGNSS();
+    if (!gpsOK) SerialMon.println("TinyGSM enableGPS() reported false (continuing with AT commands).");
+
+    // 2) Redundant: explicit SIMCOM GNSS power on
+    modem.sendAT("+CGNSPWR=1");
+    modem.waitResponse(2000L);
+
+    // 3) GNSS standalone mode (optional; some firmwares ignore)
+    modem.sendAT("+CGNSMOD=1");
+    modem.waitResponse(2000L);
+
+    // 4) Optional: only RMC sentence (keeps output light)
+    modem.sendAT("+CGNSSEQ=\"RMC\"");
+    modem.waitResponse(2000L);
+
+    // 5) Cold start (clear old data; do this only for first lock troubleshooting)
+    modem.sendAT("+CGNSCOLD");
+    modem.waitResponse(2000L);
+
+    // 6) Poll +CGNSINF once per second up to 10 minutes
+    const unsigned long timeout = 600000UL; // 10 minutes
+    unsigned long start = millis();
+    bool gotFix = false;
+
+    SerialMon.println("Waiting for GNSS fix (polling +CGNSINF)...");
+    while (millis() - start < timeout) {
+      // Ask for GNSS info
+      String inf;
+      modem.sendAT("+CGNSINF");
+      if (modem.waitResponse(3000L, inf) == 1) {
+        // Tidy & echo raw status for visibility
+        inf.trim();
+        inf.replace("\r\nOK\r\n","");
+        SerialMon.println(inf);
+
+        // Also try parsed getter for friendly output
+        float lat=0, lon=0, alt=0, acc=0, speed=0;
+        int vsat=0, usat=0;
+        if (readGNSSOnce(lat, lon, alt, acc, vsat, usat, speed)) {
+          if (lat != 0.0f || lon != 0.0f) {
+            printGNSS(lat, lon, alt, acc, vsat, usat, speed);
+            gotFix = true;
+            break;
+          }
+        }
+      } else {
+        SerialMon.println("No response to +CGNSINF this cycle.");
+      }
+
+      // Blink while waiting
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(1000);
+    }
+    digitalWrite(LED_PIN, HIGH);
+
+    if (!gotFix) {
+      SerialMon.println("Still no GNSS fix. Tips:");
+      SerialMon.println(" - Move outdoors with clear sky view (first fix can take several minutes).");
+      SerialMon.println(" - Confirm GNSS antenna is on the GNSS u.FL (not LTE) and fully snapped in.");
+      SerialMon.println(" - Keep DTR LOW (already set) so the module doesn’t sleep.");
+      SerialMon.println(" - Next boot, try WITHOUT the cold start (hot starts are faster once almanac is cached).");
+    }
+  }
+
+  SerialMon.println("\nReady for AT pass-through. Type commands below.\n");
+
+  // AT pass-through console
+  while (true) {
+    while (SerialAT.available()) {
+      SerialMon.write(SerialAT.read());
+    }
+    while (SerialMon.available()) {
+      SerialAT.write(SerialMon.read());
+    }
+  }
+}
